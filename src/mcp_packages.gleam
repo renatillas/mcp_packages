@@ -3,7 +3,6 @@ import aide/definitions
 import aide/tool
 import clockwork
 import clockwork_schedule
-import doc_builder
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/http
@@ -16,10 +15,11 @@ import gleam/option.{None, Some}
 import gleam/otp/static_supervisor
 import gleam/result
 import gleam/string
+import mcp_packages/doc_builder
+import mcp_packages/package_manager
 import mist
 import oas/json_schema
 import pack
-import package_manager
 import simplifile
 import wisp
 import wisp/wisp_mist
