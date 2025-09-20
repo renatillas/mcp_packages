@@ -8,7 +8,6 @@ import gleam/erlang/process
 import gleam/http
 import gleam/http/response.{type Response}
 import gleam/int
-import gleam/io
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
@@ -16,6 +15,7 @@ import gleam/otp/static_supervisor
 import gleam/result
 import gleam/string
 import mcp_packages/doc_builder
+import mcp_packages/interface_parser
 import mcp_packages/package_manager
 import mist
 import oas/json_schema
@@ -39,7 +39,7 @@ pub type McpParams {
 pub type ToolArguments {
   SearchArguments(query: String)
   PackageArguments(package_name: String)
-  PaginatedPackageArguments(package_name: String, page: Int, page_size: Int)
+  ModuleArguments(package_name: String, module_name: String)
 }
 
 pub type ClientInfo {
@@ -53,7 +53,8 @@ pub type ClientCapabilities {
 pub type ToolCall {
   SearchPackages(query: String)
   GetPackageInfo(package_name: String)
-  BuildPackageDocs(package_name: String)
+  GetModules(package_name: String)
+  GetModuleInfo(package_name: String, module_name: String)
 }
 
 fn refresh_packages(pack_instance: pack.Pack) -> Result(Nil, String) {
@@ -111,11 +112,13 @@ fn create_server(_pack_instance: pack.Pack) -> aide.Server(ToolCall, Nil) {
   let info_tool_schema =
     json_schema.object([json_schema.field("package_name", json_schema.string())])
 
-  let docs_tool_schema =
+  let modules_tool_schema =
+    json_schema.object([json_schema.field("package_name", json_schema.string())])
+
+  let module_info_tool_schema =
     json_schema.object([
       json_schema.field("package_name", json_schema.string()),
-      json_schema.optional_field("page", json_schema.integer()),
-      json_schema.optional_field("page_size", json_schema.integer()),
+      json_schema.field("module_name", json_schema.string()),
     ])
 
   let search_tool =
@@ -138,15 +141,26 @@ fn create_server(_pack_instance: pack.Pack) -> aide.Server(ToolCall, Nil) {
     |> tool.set_title("Get Package Info")
     |> tool.set_description("Get detailed information about a specific package")
 
-  let docs_tool =
+  let modules_tool =
     tool.new(
-      "get_package_interface",
-      [#("package_name", json_schema.Inline(docs_tool_schema), True)],
+      "get_modules",
+      [#("package_name", json_schema.Inline(modules_tool_schema), True)],
       [],
     )
-    |> tool.set_title("Build Package Docs")
+    |> tool.set_title("Get Modules")
     |> tool.set_description(
-      "Build documentation for a package and extract interface JSON. Supports pagination via 'page' (1-based) and 'page_size' (default: 70000 chars per page) parameters for large packages.",
+      "Get a list of all modules in a package with their documentation.",
+    )
+
+  let module_info_tool =
+    tool.new(
+      "get_module_info",
+      [#("package_name", json_schema.Inline(module_info_tool_schema), True)],
+      [],
+    )
+    |> tool.set_title("Get Module Info")
+    |> tool.set_description(
+      "Get detailed information about a specific module including functions and types.",
     )
 
   let packages_resource =
@@ -166,7 +180,8 @@ fn create_server(_pack_instance: pack.Pack) -> aide.Server(ToolCall, Nil) {
     tools: [
       #(search_tool, tool_decoder()),
       #(info_tool, tool_decoder()),
-      #(docs_tool, tool_decoder()),
+      #(modules_tool, tool_decoder()),
+      #(module_info_tool, tool_decoder()),
     ],
     resources: [packages_resource],
     resource_templates: [],
@@ -190,11 +205,20 @@ fn tool_decoder() -> decode.Decoder(ToolCall) {
         decode.success(GetPackageInfo(arguments))
       })
     }
-    "get_package_interface" -> {
+    "get_modules" -> {
       let query_decoder =
         decode.at(["arguments", "package_name"], decode.string)
       decode.then(query_decoder, fn(arguments) {
-        decode.success(BuildPackageDocs(arguments))
+        decode.success(GetModules(arguments))
+      })
+    }
+    "get_module_info" -> {
+      let package_decoder = decode.at(["arguments", "package_name"], decode.string)
+      let module_decoder = decode.at(["arguments", "module_name"], decode.string)
+      decode.then(package_decoder, fn(package_name) {
+        decode.then(module_decoder, fn(module_name) {
+          decode.success(GetModuleInfo(package_name, module_name))
+        })
       })
     }
     _ ->
@@ -291,14 +315,16 @@ fn tool_arguments_decoder(tool_name: String) -> decode.Decoder(ToolArguments) {
       use package_name <- decode.field("package_name", decode.string)
       decode.success(PackageArguments(package_name: package_name))
     }
-    "get_package_interface" -> {
+    "get_modules" -> {
       use package_name <- decode.field("package_name", decode.string)
-      use page <- decode.optional_field("page", 1, decode.int)
-      use page_size <- decode.optional_field("page_size", 70_000, decode.int)
-      decode.success(PaginatedPackageArguments(
+      decode.success(PackageArguments(package_name: package_name))
+    }
+    "get_module_info" -> {
+      use package_name <- decode.field("package_name", decode.string)
+      use module_name <- decode.field("module_name", decode.string)
+      decode.success(ModuleArguments(
         package_name: package_name,
-        page: page,
-        page_size: page_size,
+        module_name: module_name,
       ))
     }
     _ -> decode.failure(SearchArguments(""), "Unknown tool: " <> tool_name)
@@ -463,11 +489,40 @@ fn handle_tools_list(
       ),
     ]),
     json.object([
-      #("name", json.string("get_package_interface")),
+      #("name", json.string("get_modules")),
+      #(
+        "description",
+        json.string("Get a list of all modules in a package with their documentation."),
+      ),
+      #(
+        "inputSchema",
+        json.object([
+          #("type", json.string("object")),
+          #(
+            "properties",
+            json.object([
+              #(
+                "package_name",
+                json.object([
+                  #("type", json.string("string")),
+                  #(
+                    "description",
+                    json.string("Name of the package to get modules for"),
+                  ),
+                ]),
+              ),
+            ]),
+          ),
+          #("required", json.preprocessed_array([json.string("package_name")])),
+        ]),
+      ),
+    ]),
+    json.object([
+      #("name", json.string("get_module_info")),
       #(
         "description",
         json.string(
-          "Build documentation for a package and extract interface JSON. Supports pagination via 'page' (1-based) and 'page_size' (default: 70000 chars per page) parameters for large packages.",
+          "Get detailed information about a specific module including functions and types.",
         ),
       ),
       #(
@@ -483,35 +538,29 @@ fn handle_tools_list(
                   #("type", json.string("string")),
                   #(
                     "description",
-                    json.string(
-                      "Name of the package to build documentation for",
-                    ),
+                    json.string("Name of the package containing the module"),
                   ),
                 ]),
               ),
               #(
-                "page",
+                "module_name",
                 json.object([
-                  #("type", json.string("integer")),
+                  #("type", json.string("string")),
                   #(
                     "description",
-                    json.string("Page number (1-based) for pagination"),
-                  ),
-                ]),
-              ),
-              #(
-                "page_size",
-                json.object([
-                  #("type", json.string("integer")),
-                  #(
-                    "description",
-                    json.string("Characters per page (default: 70000)"),
+                    json.string("Name of the module to get information for"),
                   ),
                 ]),
               ),
             ]),
           ),
-          #("required", json.preprocessed_array([json.string("package_name")])),
+          #(
+            "required",
+            json.preprocessed_array([
+              json.string("package_name"),
+              json.string("module_name"),
+            ]),
+          ),
         ]),
       ),
     ]),
@@ -535,12 +584,10 @@ fn handle_tool_call(
           handle_search_packages(pack_instance, json_data.id, arguments)
         "get_package_info" ->
           handle_get_package_info(pack_instance, json_data.id, arguments)
-        "get_package_interface" ->
-          handle_build_package_docs_paginated(
-            pack_instance,
-            json_data.id,
-            arguments,
-          )
+        "get_modules" ->
+          handle_get_modules(pack_instance, json_data.id, arguments)
+        "get_module_info" ->
+          handle_get_module_info(pack_instance, json_data.id, arguments)
         _ ->
           create_error_response(
             json_data.id,
@@ -679,52 +726,80 @@ fn handle_get_package_info(
   }
 }
 
-fn handle_build_package_docs_paginated(
+fn handle_get_modules(
   pack_instance: pack.Pack,
   id: String,
   arguments: ToolArguments,
 ) -> json.Json {
   case arguments {
-    PaginatedPackageArguments(
-      package_name: package_name,
-      page: page,
-      page_size: page_size,
-    ) -> {
+    PackageArguments(package_name: package_name) -> {
       let packages_dir = package_manager.get_packages_directory(pack_instance)
       let package_path = packages_dir <> "/" <> package_name
 
-      io.println("Attempting to build docs for package: " <> package_name)
-      io.println("Package path: " <> package_path)
-      io.println(
-        "Pagination: page="
-        <> string.inspect(page)
-        <> ", page_size="
-        <> string.inspect(page_size),
-      )
-
-      // Check if directory exists and log detailed info
+      // Check if directory exists
       case simplifile.is_directory(package_path) {
         Ok(_) -> {
-          io.println("Package directory exists, proceeding with build")
           case doc_builder.build_package_docs(package_path, package_name) {
             Ok(doc_result) -> {
               case doc_result.success {
                 True -> {
-                  case simplifile.read(doc_result.interface_json_path) {
-                    Ok(json_content) -> {
-                      handle_paginated_json_response(
-                        id,
-                        json_content,
-                        package_name,
-                        page,
-                        page_size,
-                      )
+                  case interface_parser.parse_package_interface(
+                    doc_result.interface_json_path,
+                  ) {
+                    Ok(interface) -> {
+                      let modules =
+                        interface.modules
+                        |> list.map(fn(module_info) {
+                          json.object([
+                            #("name", json.string(module_info.name)),
+                            #(
+                              "documentation",
+                              json.string(module_info.documentation),
+                            ),
+                            #(
+                              "functions_count",
+                              json.int(list.length(module_info.functions)),
+                            ),
+                            #(
+                              "types_count",
+                              json.int(list.length(module_info.types)),
+                            ),
+                          ])
+                        })
+
+                      json.object([
+                        #("jsonrpc", json.string("2.0")),
+                        #("id", json.string(id)),
+                        #(
+                          "result",
+                          json.object([
+                            #(
+                              "content",
+                              json.preprocessed_array([
+                                json.object([
+                                  #("type", json.string("text")),
+                                  #(
+                                    "text",
+                                    json.string(
+                                      "Package: "
+                                      <> package_name
+                                      <> "\nModules: "
+                                      <> string.inspect(list.length(interface.modules)),
+                                    ),
+                                  ),
+                                ]),
+                              ]),
+                            ),
+                            #("modules", json.preprocessed_array(modules)),
+                          ]),
+                        ),
+                      ])
                     }
                     Error(err) ->
                       create_error_response(
                         id,
                         -32_603,
-                        "Failed to read interface JSON: " <> string.inspect(err),
+                        "Failed to parse package interface: " <> err,
                         None,
                       )
                   }
@@ -747,34 +822,168 @@ fn handle_build_package_docs_paginated(
               )
           }
         }
-        Error(_) -> {
-          io.println("Package directory not found: " <> package_path)
-          // List what's actually in the packages directory
-          case simplifile.read_directory(packages_dir) {
-            Ok(entries) -> {
-              io.println("Available packages in " <> packages_dir <> ":")
-              list.each(entries, fn(entry) { io.println("  - " <> entry) })
-            }
-            Error(dir_err) -> {
-              io.println(
-                "Failed to read packages directory: " <> string.inspect(dir_err),
-              )
-            }
-          }
+        Error(_) ->
           create_error_response(
             id,
             -32_603,
             "Package directory not found: " <> package_path,
             None,
           )
-        }
       }
     }
     _ ->
       create_error_response(
         id,
         -32_602,
-        "Invalid arguments for get_package_interface",
+        "Invalid arguments for get_modules",
+        None,
+      )
+  }
+}
+
+fn handle_get_module_info(
+  pack_instance: pack.Pack,
+  id: String,
+  arguments: ToolArguments,
+) -> json.Json {
+  case arguments {
+    ModuleArguments(package_name: package_name, module_name: module_name) -> {
+      let packages_dir = package_manager.get_packages_directory(pack_instance)
+      let package_path = packages_dir <> "/" <> package_name
+
+      case simplifile.is_directory(package_path) {
+        Ok(_) -> {
+          case doc_builder.build_package_docs(package_path, package_name) {
+            Ok(doc_result) -> {
+              case doc_result.success {
+                True -> {
+                  case interface_parser.parse_package_interface(
+                    doc_result.interface_json_path,
+                  ) {
+                    Ok(interface) -> {
+                      case interface_parser.get_module_info(interface, module_name) {
+                        Ok(module_info) -> {
+                          let functions =
+                            module_info.functions
+                            |> list.map(fn(func) {
+                              json.object([
+                                #("name", json.string(func.name)),
+                                #("signature", json.string(func.signature)),
+                                #(
+                                  "documentation",
+                                  json.string(func.documentation),
+                                ),
+                                #(
+                                  "parameters",
+                                  json.preprocessed_array(
+                                    list.map(func.parameters, fn(param) {
+                                      json.object([
+                                        #("label", json.string(param.label)),
+                                        #("type", json.string(param.type_name)),
+                                      ])
+                                    }),
+                                  ),
+                                ),
+                              ])
+                            })
+
+                          let types =
+                            module_info.types
+                            |> list.map(fn(type_info) {
+                              json.object([
+                                #("name", json.string(type_info.name)),
+                                #(
+                                  "documentation",
+                                  json.string(type_info.documentation),
+                                ),
+                              ])
+                            })
+
+                          json.object([
+                            #("jsonrpc", json.string("2.0")),
+                            #("id", json.string(id)),
+                            #(
+                              "result",
+                              json.object([
+                                #(
+                                  "content",
+                                  json.preprocessed_array([
+                                    json.object([
+                                      #("type", json.string("text")),
+                                      #(
+                                        "text",
+                                        json.string(
+                                          "Module: "
+                                          <> module_name
+                                          <> " (from "
+                                          <> package_name
+                                          <> ")\n"
+                                          <> module_info.documentation
+                                          <> "\n\nFunctions: "
+                                          <> string.inspect(list.length(functions))
+                                          <> "\nTypes: "
+                                          <> string.inspect(list.length(types)),
+                                        ),
+                                      ),
+                                    ]),
+                                  ]),
+                                ),
+                                #("functions", json.preprocessed_array(functions)),
+                                #("types", json.preprocessed_array(types)),
+                              ]),
+                            ),
+                          ])
+                        }
+                        Error(err) ->
+                          create_error_response(
+                            id,
+                            -32_603,
+                            "Module not found: " <> err,
+                            None,
+                          )
+                      }
+                    }
+                    Error(err) ->
+                      create_error_response(
+                        id,
+                        -32_603,
+                        "Failed to parse package interface: " <> err,
+                        None,
+                      )
+                  }
+                }
+                False ->
+                  create_error_response(
+                    id,
+                    -32_603,
+                    "Documentation build failed: " <> doc_result.error_message,
+                    None,
+                  )
+              }
+            }
+            Error(err) ->
+              create_error_response(
+                id,
+                -32_603,
+                "Documentation build failed: " <> err,
+                None,
+              )
+          }
+        }
+        Error(_) ->
+          create_error_response(
+            id,
+            -32_603,
+            "Package directory not found: " <> package_path,
+            None,
+          )
+      }
+    }
+    _ ->
+      create_error_response(
+        id,
+        -32_602,
+        "Invalid arguments for get_module_info",
         None,
       )
   }
@@ -884,97 +1093,6 @@ fn handle_resource_read(
   }
 }
 
-fn handle_paginated_json_response(
-  id: String,
-  json_content: String,
-  package_name: String,
-  page: Int,
-  page_size: Int,
-) -> json.Json {
-  let content_length = string.length(json_content)
-  let total_pages = { content_length + page_size - 1 } / page_size
-  // Ceiling division
-
-  io.println(
-    "Package interface JSON size: "
-    <> string.inspect(content_length)
-    <> " characters",
-  )
-  io.println(
-    "Pagination: page "
-    <> string.inspect(page)
-    <> " of "
-    <> string.inspect(total_pages)
-    <> ", page_size="
-    <> string.inspect(page_size),
-  )
-
-  case page <= total_pages && page > 0 {
-    True -> {
-      let start_pos = { page - 1 } * page_size
-      let page_content = string.slice(json_content, start_pos, page_size)
-
-      let pagination_header =
-        "📄 Package Interface - Page "
-        <> string.inspect(page)
-        <> " of "
-        <> string.inspect(total_pages)
-        <> "\n"
-        <> "Package: "
-        <> package_name
-        <> "\n"
-        <> "Total size: "
-        <> string.inspect(content_length)
-        <> " characters\n"
-        <> "Showing characters "
-        <> string.inspect(start_pos + 1)
-        <> " to "
-        <> string.inspect(start_pos + string.length(page_content))
-        <> "\n\n"
-
-      let response_content = pagination_header <> page_content
-
-      json.object([
-        #("jsonrpc", json.string("2.0")),
-        #("id", json.string(id)),
-        #(
-          "result",
-          json.object([
-            #(
-              "content",
-              json.preprocessed_array([
-                json.object([
-                  #("type", json.string("text")),
-                  #("text", json.string(response_content)),
-                ]),
-              ]),
-            ),
-            #(
-              "pagination",
-              json.object([
-                #("current_page", json.int(page)),
-                #("total_pages", json.int(total_pages)),
-                #("page_size", json.int(page_size)),
-                #("total_size", json.int(content_length)),
-              ]),
-            ),
-          ]),
-        ),
-      ])
-    }
-    False -> {
-      create_error_response(
-        id,
-        -32_602,
-        "Invalid page "
-          <> string.inspect(page)
-          <> ". Must be between 1 and "
-          <> string.inspect(total_pages),
-        None,
-      )
-    }
-  }
-}
 
 fn init_persistent_storage() -> Result(Nil, String) {
   // Initialize docs cache directory
