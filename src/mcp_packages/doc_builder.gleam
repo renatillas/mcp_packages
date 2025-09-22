@@ -67,7 +67,7 @@ fn run_gleam_docs_build(package_path: String) -> Result(String, String) {
       run: "gleam",
       with: ["docs", "build"],
       in: package_path,
-      opt: [],
+      opt: [shellout.LetBeStderr],
     )
   {
     Ok(output) -> {
