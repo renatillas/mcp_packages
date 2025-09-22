@@ -1,6 +1,6 @@
+import gleam/dict.{type Dict}
 import gleam/dynamic
 import gleam/dynamic/decode
-import gleam/dict.{type Dict}
 import gleam/int
 import gleam/json
 import gleam/list
@@ -8,11 +8,7 @@ import gleam/string
 import simplifile
 
 pub type PackageInterface {
-  PackageInterface(
-    name: String,
-    version: String,
-    modules: List(ModuleInfo),
-  )
+  PackageInterface(name: String, version: String, modules: List(ModuleInfo))
 }
 
 pub type ModuleInfo {
@@ -25,10 +21,7 @@ pub type ModuleInfo {
 }
 
 pub type TypeInfo {
-  TypeInfo(
-    name: String,
-    documentation: String,
-  )
+  TypeInfo(name: String, documentation: String)
 }
 
 pub type FunctionInfo {
@@ -41,10 +34,7 @@ pub type FunctionInfo {
 }
 
 pub type ParameterInfo {
-  ParameterInfo(
-    label: String,
-    type_name: String,
-  )
+  ParameterInfo(label: String, type_name: String)
 }
 
 type ModuleData {
@@ -76,9 +66,12 @@ fn interface_decoder() -> decode.Decoder(PackageInterface) {
   {
     use name <- decode.field("name", decode.string)
     use version <- decode.field("version", decode.string)
-    use modules_dict <- decode.field("modules", decode.dict(decode.string, module_data_decoder()))
-    
-    let modules = 
+    use modules_dict <- decode.field(
+      "modules",
+      decode.dict(decode.string, module_data_decoder()),
+    )
+
+    let modules =
       modules_dict
       |> dict.to_list()
       |> list.map(fn(entry) {
@@ -90,7 +83,7 @@ fn interface_decoder() -> decode.Decoder(PackageInterface) {
           types: extract_types(module_data.types),
         )
       })
-    
+
     decode.success(PackageInterface(
       name: name,
       version: version,
@@ -101,12 +94,23 @@ fn interface_decoder() -> decode.Decoder(PackageInterface) {
 
 fn module_data_decoder() -> decode.Decoder(ModuleData) {
   {
-    use documentation <- decode.field("documentation", decode.list(decode.string))
-    use functions <- decode.optional_field("functions", dict.new(), decode.dict(decode.string, decode.dynamic))
-    use types <- decode.optional_field("types", dict.new(), decode.dict(decode.string, decode.dynamic))
-    
+    use documentation <- decode.field(
+      "documentation",
+      decode.list(decode.string),
+    )
+    use functions <- decode.optional_field(
+      "functions",
+      dict.new(),
+      decode.dict(decode.string, decode.dynamic),
+    )
+    use types <- decode.optional_field(
+      "types",
+      dict.new(),
+      decode.dict(decode.string, decode.dynamic),
+    )
+
     let doc_string = string.join(documentation, " ")
-    
+
     decode.success(ModuleData(
       documentation: doc_string,
       functions: functions,
@@ -115,31 +119,39 @@ fn module_data_decoder() -> decode.Decoder(ModuleData) {
   }
 }
 
-fn extract_functions(functions_dict: Dict(String, dynamic.Dynamic)) -> List(FunctionInfo) {
+fn extract_functions(
+  functions_dict: Dict(String, dynamic.Dynamic),
+) -> List(FunctionInfo) {
   functions_dict
   |> dict.to_list()
   |> list.map(fn(entry) {
     let #(func_name, func_data) = entry
-    let documentation = 
-      case decode.run(func_data, decode.at(["documentation"], decode.string)) {
-        Ok(doc) -> doc
-        Error(_) -> ""
-      }
-    
-    let parameters = 
-      case decode.run(func_data, decode.at(["parameters"], decode.list(decode.dynamic))) {
-        Ok(params_list) -> extract_parameters(params_list)
-        Error(_) -> []
-      }
-    
-    let return_type = 
-      case decode.run(func_data, decode.at(["return"], decode.dynamic)) {
-        Ok(return_dynamic) -> extract_type_name(return_dynamic)
-        Error(_) -> "unknown"
-      }
-    
+    let documentation = case
+      decode.run(func_data, decode.at(["documentation"], decode.string))
+    {
+      Ok(doc) -> doc
+      Error(_) -> ""
+    }
+
+    let parameters = case
+      decode.run(
+        func_data,
+        decode.at(["parameters"], decode.list(decode.dynamic)),
+      )
+    {
+      Ok(params_list) -> extract_parameters(params_list)
+      Error(_) -> []
+    }
+
+    let return_type = case
+      decode.run(func_data, decode.at(["return"], decode.dynamic))
+    {
+      Ok(return_dynamic) -> extract_type_name(return_dynamic)
+      Error(_) -> "unknown"
+    }
+
     let signature = build_function_signature(func_name, parameters, return_type)
-    
+
     FunctionInfo(
       name: func_name,
       documentation: documentation,
@@ -152,87 +164,109 @@ fn extract_functions(functions_dict: Dict(String, dynamic.Dynamic)) -> List(Func
 fn extract_parameters(params_list: List(dynamic.Dynamic)) -> List(ParameterInfo) {
   params_list
   |> list.map(fn(param_dynamic) {
-    let label = case decode.run(param_dynamic, decode.at(["label"], decode.string)) {
-      Ok(label_str) -> case label_str {
-        "" -> ""
-        _ -> label_str
-      }
+    let label = case
+      decode.run(param_dynamic, decode.at(["label"], decode.string))
+    {
+      Ok(label_str) ->
+        case label_str {
+          "" -> ""
+          _ -> label_str
+        }
       Error(_) -> ""
     }
-    
-    let type_name = case decode.run(param_dynamic, decode.at(["type"], decode.dynamic)) {
+
+    let type_name = case
+      decode.run(param_dynamic, decode.at(["type"], decode.dynamic))
+    {
       Ok(type_dynamic) -> extract_type_name(type_dynamic)
       Error(_) -> "unknown"
     }
-    
-    ParameterInfo(
-      label: label,
-      type_name: type_name,
-    )
+
+    ParameterInfo(label: label, type_name: type_name)
   })
 }
 
 fn extract_type_name(type_dynamic: dynamic.Dynamic) -> String {
   case decode.run(type_dynamic, decode.at(["kind"], decode.string)) {
-    Ok(kind) -> case kind {
-      "named" -> {
-        let name = case decode.run(type_dynamic, decode.at(["name"], decode.string)) {
-          Ok(type_name) -> type_name
-          Error(_) -> "unknown"
-        }
-        
-        let package = case decode.run(type_dynamic, decode.at(["package"], decode.string)) {
-          Ok("") -> ""
-          Ok(pkg) -> pkg <> "/"
-          Error(_) -> ""
-        }
-        
-        let module = case decode.run(type_dynamic, decode.at(["module"], decode.string)) {
-          Ok("gleam") -> ""  // Built-in types don't need module prefix
-          Ok(mod) -> mod <> "."
-          Error(_) -> ""
-        }
-        
-        package <> module <> name
-      }
-      "variable" -> {
-        case decode.run(type_dynamic, decode.at(["id"], decode.int)) {
-          Ok(id) -> case id {
-            0 -> "a"
-            1 -> "b"
-            2 -> "c"
-            n -> "t" <> int.to_string(n)
+    Ok(kind) ->
+      case kind {
+        "named" -> {
+          let name = case
+            decode.run(type_dynamic, decode.at(["name"], decode.string))
+          {
+            Ok(type_name) -> type_name
+            Error(_) -> "unknown"
           }
-          Error(_) -> "a"
+
+          let package = case
+            decode.run(type_dynamic, decode.at(["package"], decode.string))
+          {
+            Ok("") -> ""
+            Ok(pkg) -> pkg <> "/"
+            Error(_) -> ""
+          }
+
+          let module = case
+            decode.run(type_dynamic, decode.at(["module"], decode.string))
+          {
+            Ok("gleam") -> ""
+            // Built-in types don't need module prefix
+            Ok(mod) -> mod <> "."
+            Error(_) -> ""
+          }
+
+          package <> module <> name
         }
-      }
-      "fn" -> {
-        let params = case decode.run(type_dynamic, decode.at(["parameters"], decode.list(decode.dynamic))) {
-          Ok(param_types) -> {
-            let param_strs = list.map(param_types, extract_type_name)
-            case param_strs {
-              [] -> "()"
-              types -> "(" <> string.join(types, ", ") <> ")"
+        "variable" -> {
+          case decode.run(type_dynamic, decode.at(["id"], decode.int)) {
+            Ok(id) ->
+              case id {
+                0 -> "a"
+                1 -> "b"
+                2 -> "c"
+                n -> "t" <> int.to_string(n)
+              }
+            Error(_) -> "a"
+          }
+        }
+        "fn" -> {
+          let params = case
+            decode.run(
+              type_dynamic,
+              decode.at(["parameters"], decode.list(decode.dynamic)),
+            )
+          {
+            Ok(param_types) -> {
+              let param_strs = list.map(param_types, extract_type_name)
+              case param_strs {
+                [] -> "()"
+                types -> "(" <> string.join(types, ", ") <> ")"
+              }
             }
+            Error(_) -> "()"
           }
-          Error(_) -> "()"
+
+          let return_type = case
+            decode.run(type_dynamic, decode.at(["return"], decode.dynamic))
+          {
+            Ok(ret_type) -> extract_type_name(ret_type)
+            Error(_) -> "unknown"
+          }
+
+          "fn" <> params <> " -> " <> return_type
         }
-        
-        let return_type = case decode.run(type_dynamic, decode.at(["return"], decode.dynamic)) {
-          Ok(ret_type) -> extract_type_name(ret_type)
-          Error(_) -> "unknown"
-        }
-        
-        "fn" <> params <> " -> " <> return_type
+        _ -> "unknown"
       }
-      _ -> "unknown"
-    }
     Error(_) -> "unknown"
   }
 }
 
-fn build_function_signature(func_name: String, parameters: List(ParameterInfo), return_type: String) -> String {
-  let param_strings = 
+fn build_function_signature(
+  func_name: String,
+  parameters: List(ParameterInfo),
+  return_type: String,
+) -> String {
+  let param_strings =
     parameters
     |> list.map(fn(param) {
       case param.label {
@@ -240,12 +274,12 @@ fn build_function_signature(func_name: String, parameters: List(ParameterInfo), 
         label -> label <> ": " <> param.type_name
       }
     })
-  
+
   let params_str = case param_strings {
     [] -> func_name <> "()"
     params -> func_name <> "(" <> string.join(params, ", ") <> ")"
   }
-  
+
   params_str <> " -> " <> return_type
 }
 
@@ -254,19 +288,16 @@ fn extract_types(types_dict: Dict(String, dynamic.Dynamic)) -> List(TypeInfo) {
   |> dict.to_list()
   |> list.map(fn(entry) {
     let #(type_name, type_data) = entry
-    let documentation = 
-      case decode.run(type_data, decode.at(["documentation"], decode.string)) {
-        Ok(doc) -> doc
-        Error(_) -> ""
-      }
-    
-    TypeInfo(
-      name: type_name,
-      documentation: documentation,
-    )
+    let documentation = case
+      decode.run(type_data, decode.at(["documentation"], decode.string))
+    {
+      Ok(doc) -> doc
+      Error(_) -> ""
+    }
+
+    TypeInfo(name: type_name, documentation: documentation)
   })
 }
-
 
 pub fn search_functions(
   interface: PackageInterface,

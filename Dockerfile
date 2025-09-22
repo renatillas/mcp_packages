@@ -1,8 +1,6 @@
 # Use the official Gleam image with Erlang
 FROM ghcr.io/gleam-lang/gleam:v1.12.0-erlang-alpine AS build
 
-# Install system dependencies first
-RUN apk add --no-cache git
 
 # Set working directory and copy source
 WORKDIR /app
@@ -14,6 +12,8 @@ RUN date > /tmp/build_time && rm -rf build && gleam export erlang-shipment
 FROM erlang:27.1.1.0-alpine 
 
 COPY --from=build /app/build/erlang-shipment /app
+# Install system dependencies first
+RUN apk add --no-cache git
 
 RUN mkdir -p /app/.local/share /app/.cache /tmp /data /app/docs_cache
 RUN chmod 755 /app/.local/share /app/.cache /tmp /data /app/docs_cache
