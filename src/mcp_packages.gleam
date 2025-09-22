@@ -12,7 +12,6 @@ import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/otp/static_supervisor
-import gleam/result
 import gleam/string
 import mcp_packages/doc_builder
 import mcp_packages/interface_parser
@@ -61,11 +60,11 @@ fn refresh_packages(pack_instance: pack.Pack) -> Result(Nil, String) {
   package_manager.download_packages_to_disc(pack_instance)
 }
 
-pub fn main() {
+pub fn main() -> Nil {
   // Initialize persistent storage directories
-  use _ <- result.try(init_persistent_storage())
+  let assert Ok(_) = init_persistent_storage()
 
-  use pack_instance <- result.try(package_manager.init_pack())
+  let assert Ok(pack_instance) = package_manager.init_pack()
   let scheduler_receiver = process.new_subject()
   let schedule = clockwork.default() |> clockwork.with_hour(clockwork.every(6))
   let schedule =
@@ -95,7 +94,7 @@ pub fn main() {
     |> static_supervisor.add(server)
     |> static_supervisor.start()
 
-  Ok(process.sleep_forever())
+  process.sleep_forever()
 }
 
 fn create_server(_pack_instance: pack.Pack) -> aide.Server(ToolCall, Nil) {
@@ -213,8 +212,10 @@ fn tool_decoder() -> decode.Decoder(ToolCall) {
       })
     }
     "get_module_info" -> {
-      let package_decoder = decode.at(["arguments", "package_name"], decode.string)
-      let module_decoder = decode.at(["arguments", "module_name"], decode.string)
+      let package_decoder =
+        decode.at(["arguments", "package_name"], decode.string)
+      let module_decoder =
+        decode.at(["arguments", "module_name"], decode.string)
       decode.then(package_decoder, fn(package_name) {
         decode.then(module_decoder, fn(module_name) {
           decode.success(GetModuleInfo(package_name, module_name))
@@ -492,7 +493,9 @@ fn handle_tools_list(
       #("name", json.string("get_modules")),
       #(
         "description",
-        json.string("Get a list of all modules in a package with their documentation."),
+        json.string(
+          "Get a list of all modules in a package with their documentation.",
+        ),
       ),
       #(
         "inputSchema",
@@ -743,9 +746,11 @@ fn handle_get_modules(
             Ok(doc_result) -> {
               case doc_result.success {
                 True -> {
-                  case interface_parser.parse_package_interface(
-                    doc_result.interface_json_path,
-                  ) {
+                  case
+                    interface_parser.parse_package_interface(
+                      doc_result.interface_json_path,
+                    )
+                  {
                     Ok(interface) -> {
                       let modules =
                         interface.modules
@@ -784,7 +789,9 @@ fn handle_get_modules(
                                       "Package: "
                                       <> package_name
                                       <> "\nModules: "
-                                      <> string.inspect(list.length(interface.modules)),
+                                      <> string.inspect(list.length(
+                                        interface.modules,
+                                      )),
                                     ),
                                   ),
                                 ]),
@@ -857,11 +864,15 @@ fn handle_get_module_info(
             Ok(doc_result) -> {
               case doc_result.success {
                 True -> {
-                  case interface_parser.parse_package_interface(
-                    doc_result.interface_json_path,
-                  ) {
+                  case
+                    interface_parser.parse_package_interface(
+                      doc_result.interface_json_path,
+                    )
+                  {
                     Ok(interface) -> {
-                      case interface_parser.get_module_info(interface, module_name) {
+                      case
+                        interface_parser.get_module_info(interface, module_name)
+                      {
                         Ok(module_info) -> {
                           let functions =
                             module_info.functions
@@ -920,7 +931,9 @@ fn handle_get_module_info(
                                           <> ")\n"
                                           <> module_info.documentation
                                           <> "\n\nFunctions: "
-                                          <> string.inspect(list.length(functions))
+                                          <> string.inspect(list.length(
+                                            functions,
+                                          ))
                                           <> "\nTypes: "
                                           <> string.inspect(list.length(types)),
                                         ),
@@ -928,7 +941,10 @@ fn handle_get_module_info(
                                     ]),
                                   ]),
                                 ),
-                                #("functions", json.preprocessed_array(functions)),
+                                #(
+                                  "functions",
+                                  json.preprocessed_array(functions),
+                                ),
                                 #("types", json.preprocessed_array(types)),
                               ]),
                             ),
@@ -1092,7 +1108,6 @@ fn handle_resource_read(
       )
   }
 }
-
 
 fn init_persistent_storage() -> Result(Nil, String) {
   // Initialize docs cache directory
