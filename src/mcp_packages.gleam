@@ -755,6 +755,16 @@ fn handle_get_modules(
                       let modules =
                         interface.modules
                         |> list.map(fn(module_info) {
+                          let types_info =
+                            module_info.types
+                            |> list.map(fn(type_info) {
+                              json.object([
+                                #("name", json.string(type_info.name)),
+                                #("signature", json.string(type_info.signature)),
+                                #("type_kind", json.string(type_info.type_kind)),
+                              ])
+                            })
+
                           json.object([
                             #("name", json.string(module_info.name)),
                             #(
@@ -769,6 +779,7 @@ fn handle_get_modules(
                               "types_count",
                               json.int(list.length(module_info.types)),
                             ),
+                            #("types", json.preprocessed_array(types_info)),
                           ])
                         })
 
@@ -903,6 +914,8 @@ fn handle_get_module_info(
                             |> list.map(fn(type_info) {
                               json.object([
                                 #("name", json.string(type_info.name)),
+                                #("signature", json.string(type_info.signature)),
+                                #("type_kind", json.string(type_info.type_kind)),
                                 #(
                                   "documentation",
                                   json.string(type_info.documentation),

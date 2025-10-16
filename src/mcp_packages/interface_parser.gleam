@@ -21,7 +21,12 @@ pub type ModuleInfo {
 }
 
 pub type TypeInfo {
-  TypeInfo(name: String, documentation: String)
+  TypeInfo(
+    name: String,
+    documentation: String,
+    signature: String,
+    type_kind: String,
+  )
 }
 
 pub type FunctionInfo {
@@ -283,6 +288,92 @@ fn build_function_signature(
   params_str <> " -> " <> return_type
 }
 
+fn build_type_signature(
+  type_name: String,
+  type_data: dynamic.Dynamic,
+) -> String {
+  // Extract type parameters/variables
+  let type_params = case
+    decode.run(type_data, decode.at(["parameters"], decode.list(decode.string)))
+  {
+    Ok(params) ->
+      case params {
+        [] -> ""
+        p -> "(" <> string.join(p, ", ") <> ")"
+      }
+    Error(_) -> ""
+  }
+
+  // Extract constructors for custom types
+  let constructors = case
+    decode.run(
+      type_data,
+      decode.at(["constructors"], decode.list(decode.dynamic)),
+    )
+  {
+    Ok(constructors_list) -> extract_constructors(constructors_list)
+    Error(_) -> ""
+  }
+
+  // Build the full signature
+  case constructors {
+    "" -> "type " <> type_name <> type_params
+    c -> "type " <> type_name <> type_params <> " = " <> c
+  }
+}
+
+fn extract_constructors(constructors_list: List(dynamic.Dynamic)) -> String {
+  let constructor_strs =
+    constructors_list
+    |> list.map(fn(constructor) {
+      let constructor_name = case
+        decode.run(constructor, decode.at(["name"], decode.string))
+      {
+        Ok(name) -> name
+        Error(_) -> "Unknown"
+      }
+
+      let fields = case
+        decode.run(
+          constructor,
+          decode.at(["fields"], decode.list(decode.dynamic)),
+        )
+      {
+        Ok(fields_list) -> {
+          let field_strs =
+            fields_list
+            |> list.map(fn(field) {
+              let field_name = case
+                decode.run(field, decode.at(["name"], decode.string))
+              {
+                Ok(name) -> name <> ": "
+                Error(_) -> ""
+              }
+
+              let field_type = case
+                decode.run(field, decode.at(["type"], decode.dynamic))
+              {
+                Ok(field_type_data) -> extract_type_name(field_type_data)
+                Error(_) -> "unknown"
+              }
+
+              field_name <> field_type
+            })
+
+          case field_strs {
+            [] -> constructor_name
+            fields -> constructor_name <> "(" <> string.join(fields, ", ") <> ")"
+          }
+        }
+        Error(_) -> constructor_name
+      }
+
+      fields
+    })
+
+  string.join(constructor_strs, " | ")
+}
+
 fn extract_types(types_dict: Dict(String, dynamic.Dynamic)) -> List(TypeInfo) {
   types_dict
   |> dict.to_list()
@@ -295,7 +386,22 @@ fn extract_types(types_dict: Dict(String, dynamic.Dynamic)) -> List(TypeInfo) {
       Error(_) -> ""
     }
 
-    TypeInfo(name: type_name, documentation: documentation)
+    let type_kind = case
+      decode.run(type_data, decode.at(["opaque"], decode.bool))
+    {
+      Ok(True) -> "opaque"
+      Ok(False) -> "custom"
+      Error(_) -> "unknown"
+    }
+
+    let signature = build_type_signature(type_name, type_data)
+
+    TypeInfo(
+      name: type_name,
+      documentation: documentation,
+      signature: signature,
+      type_kind: type_kind,
+    )
   })
 }
 
