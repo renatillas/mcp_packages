@@ -312,13 +312,22 @@ fn handle_search_packages(id: String, arguments: ToolArguments) -> Promise(json.
               ])
             })
 
+          // Build package list text with details
+          let package_list_text =
+            search_result.packages
+            |> list.map(fn(pkg) {
+              "- " <> pkg.name <> " v" <> pkg.version <> " (" <> int.to_string(pkg.downloads) <> " downloads)\n  " <> pkg.description
+            })
+            |> string.join("\n")
+
           create_tool_result(
             id,
             "Found "
               <> int.to_string(search_result.total)
               <> " packages matching '"
               <> query
-              <> "'",
+              <> "':\n\n"
+              <> package_list_text,
             Some(json.object([#("packages", json.preprocessed_array(packages))])),
           )
         }
@@ -467,6 +476,34 @@ fn handle_get_module_info(id: String, arguments: ToolArguments) -> Promise(json.
                   ])
                 })
 
+              // Build function list text
+              let functions_text =
+                module_info.functions
+                |> list.map(fn(func) { "- " <> func.signature })
+                |> string.join("\n")
+
+              // Build types list text
+              let types_text =
+                module_info.types
+                |> list.map(fn(t) { "- " <> t.signature })
+                |> string.join("\n")
+
+              let text_content =
+                "Module: "
+                <> module_name
+                <> " (from "
+                <> package_name
+                <> ")\n\n"
+                <> module_info.documentation
+                <> "\n\n## Functions ("
+                <> int.to_string(list.length(module_info.functions))
+                <> "):\n"
+                <> functions_text
+                <> "\n\n## Types ("
+                <> int.to_string(list.length(module_info.types))
+                <> "):\n"
+                <> types_text
+
               json.object([
                 #("jsonrpc", json.string("2.0")),
                 #("id", json.string(id)),
@@ -478,21 +515,7 @@ fn handle_get_module_info(id: String, arguments: ToolArguments) -> Promise(json.
                       json.preprocessed_array([
                         json.object([
                           #("type", json.string("text")),
-                          #(
-                            "text",
-                            json.string(
-                              "Module: "
-                                <> module_name
-                                <> " (from "
-                                <> package_name
-                                <> ")\n"
-                                <> module_info.documentation
-                                <> "\n\nFunctions: "
-                                <> int.to_string(list.length(functions))
-                                <> "\nTypes: "
-                                <> int.to_string(list.length(types)),
-                            ),
-                          ),
+                          #("text", json.string(text_content)),
                         ]),
                       ]),
                     ),
