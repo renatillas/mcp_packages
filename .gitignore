@@ -1,4 +1,23 @@
-*.beam
+# Build artifacts
+/build/
+/target/
+
+# Dependencies
+/node_modules/
+
+# Gleam
 *.ez
-/build
 erl_crash.dump
+
+# IDE
+.idea/
+*.swp
+*.swo
+.vscode/
+
+# Wrangler
+.wrangler/
+.dev.vars
+
+# Lock files (keep manifest.toml for reproducible builds)
+package-lock.json

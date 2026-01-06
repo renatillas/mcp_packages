@@ -1,0 +1,14 @@
+{
+  "name": "gleam-package-mcp",
+  "version": "2.0.0",
+  "description": "MCP server for Gleam package documentation via hexdocs.pm",
+  "type": "module",
+  "scripts": {
+    "build": "gleam build",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
