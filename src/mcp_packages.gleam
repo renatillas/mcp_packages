@@ -479,14 +479,24 @@ fn handle_get_module_info(id: String, arguments: ToolArguments) -> Promise(json.
               // Build function list text
               let functions_text =
                 module_info.functions
-                |> list.map(fn(func) { "- " <> func.signature })
-                |> string.join("\n")
+                |> list.map(fn(func) {
+                  case func.documentation {
+                    "" -> "### " <> func.signature
+                    doc -> "### " <> func.signature <> "\n" <> doc
+                  }
+                })
+                |> string.join("\n\n")
 
               // Build types list text
               let types_text =
                 module_info.types
-                |> list.map(fn(t) { "- " <> t.signature })
-                |> string.join("\n")
+                |> list.map(fn(t) {
+                  case t.documentation {
+                    "" -> "### " <> t.signature
+                    doc -> "### " <> t.signature <> "\n" <> doc
+                  }
+                })
+                |> string.join("\n\n")
 
               let text_content =
                 "Module: "

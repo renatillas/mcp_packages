@@ -2,9 +2,10 @@
 // This file bridges the Gleam application to the Cloudflare Workers runtime
 
 import { fetch as gleamFetch } from "../build/dev/javascript/mcp_packages/mcp_packages.mjs";
-import { Post } from "../build/dev/javascript/gleam_http/gleam/http.mjs";
-import { Some, None } from "../build/dev/javascript/gleam_stdlib/gleam/option.mjs";
-import { Https, Http } from "../build/dev/javascript/gleam_http/gleam/http.mjs";
+import { Method$Post } from "../build/dev/javascript/gleam_http/gleam/http.mjs";
+import { List } from "../build/dev/javascript/prelude.mjs";
+import { Option$Some, Option$None } from "../build/dev/javascript/gleam_stdlib/gleam/option.mjs";
+import { Scheme$Https, Scheme$Http } from "../build/dev/javascript/gleam_http/gleam/http.mjs";
 
 // Convert a JavaScript Request to a Gleam Request
 function toGleamRequest(jsRequest, body) {
@@ -29,13 +30,13 @@ function toGleamRequest(jsRequest, body) {
   }
 
   // Convert to proper Gleam list format (toList style)
-  const headersList = gleamListFromArray(
+  const headersList = List.fromArray(
     Array.from(jsRequest.headers.entries()).map(([k, v]) => [k.toLowerCase(), v])
   );
 
   // Parse query parameters
-  const query = url.search ? new Some(url.search.slice(1)) : new None();
-  const port = url.port ? new Some(parseInt(url.port)) : new None();
+  const query = url.search ? Option$Some(url.search.slice(1)) : Option$None();
+  const port = url.port ? Option$Some(parseInt(url.port)) : Option$None();
 
   // Map HTTP method string to Gleam type
   const method = methodFromString(jsRequest.method);
@@ -44,7 +45,7 @@ function toGleamRequest(jsRequest, body) {
     method: method,
     headers: headersList,
     body: body,
-    scheme: url.protocol === "https:" ? new Https() : new Http(),
+    scheme: url.protocol === "https:" ? Scheme$Https() : Scheme$Http(),
     host: url.hostname,
     port: port,
     path: url.pathname,
@@ -52,35 +53,16 @@ function toGleamRequest(jsRequest, body) {
   };
 }
 
-// Convert an array to a Gleam-style linked list
-function gleamListFromArray(arr) {
-  let list = { head: undefined, tail: undefined };
-  for (let i = arr.length - 1; i >= 0; i--) {
-    list = { head: arr[i], tail: list };
-  }
-  return list;
-}
-
 // Map HTTP method string to Gleam enum value
-function methodFromString(method) {
-  return new Post();  // For MCP, we only handle POST requests
+function methodFromString(_) {
+  return Method$Post();  // For MCP, we only handle POST requests
 }
 
-// Convert a Gleam linked list to a JavaScript array
-function gleamListToArray(list) {
-  const result = [];
-  let current = list;
-  while (current && current.head !== undefined) {
-    result.push(current.head);
-    current = current.tail;
-  }
-  return result;
-}
 
 // Convert a Gleam Response to a JavaScript Response
 function toJsResponse(gleamResponse) {
   const headers = new Headers();
-  const headersList = gleamListToArray(gleamResponse.headers);
+  const headersList = gleamResponse.headers.toArray();
   for (const [key, value] of headersList) {
     headers.set(key, value);
   }
@@ -92,7 +74,7 @@ function toJsResponse(gleamResponse) {
 }
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env, _) {
     try {
       // Read the request body
       const body = await request.text();

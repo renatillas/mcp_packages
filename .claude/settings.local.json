@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(docker build:*)"
+      "Bash(docker build:*)",
+      "mcp__gleam_packages__get_module_info"
     ],
     "deny": [],
     "ask": []

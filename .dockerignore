@@ -1,8 +1,0 @@
-.git
-.gitignore
-*.md
-build/
-.cache/
-.DS_Store
-fly.toml
-*.log
