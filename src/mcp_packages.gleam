@@ -8,6 +8,7 @@ import gleam/javascript/promise.{type Promise}
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/string
 import mcp_packages/hex_client
 import mcp_packages/interface_parser
 
@@ -394,14 +395,22 @@ fn handle_get_modules(id: String, arguments: ToolArguments) -> Promise(json.Json
               ])
             })
 
+          // Build module list text with names
+          let module_list_text =
+            interface.modules
+            |> list.map(fn(m) {
+              "- " <> m.name <> " (" <> int.to_string(list.length(m.functions)) <> " functions, " <> int.to_string(list.length(m.types)) <> " types)"
+            })
+            |> string.join("\n")
+
           create_tool_result(
             id,
             "Package: "
               <> package_name
               <> " (v"
               <> interface.version
-              <> ")\nModules: "
-              <> int.to_string(list.length(interface.modules)),
+              <> ")\n\nModules:\n"
+              <> module_list_text,
             Some(json.object([#("modules", json.preprocessed_array(modules))])),
           )
         }

@@ -149,7 +149,7 @@ fn package_decoder() -> decode.Decoder(Package) {
   use latest_version <- decode.optional_field(
     "latest_stable_version",
     "",
-    decode.string,
+    decode.optional(decode.string) |> decode.map(fn(o) { option.unwrap(o, "") }),
   )
   use meta <- decode.optional_field("meta", #("", []), meta_decoder())
   use downloads <- decode.optional_field("downloads", 0, downloads_decoder())
