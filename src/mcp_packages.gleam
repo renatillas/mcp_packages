@@ -12,6 +12,7 @@ import gleam/string
 import mcp_packages/cache
 import mcp_packages/hex_client
 import mcp_packages/interface_parser
+import mcp_packages/logger
 import plinth/cloudflare/bindings
 import plinth/cloudflare/d1.{type Database}
 import plinth/cloudflare/worker.{type Context}
@@ -56,6 +57,7 @@ pub fn fetch(
   ctx: Context,
 ) -> Promise(JsResponse) {
   let request = conversation.to_gleam_request(js_request)
+  logger.request(http.method_to_string(request.method), request.path)
 
   // Extract D1 database from env bindings
   let db = bindings.d1_database(env, "DB") |> option.from_result
@@ -67,6 +69,7 @@ pub fn fetch(
       case body_result {
         Ok(body) -> handle_post_body(body, worker_ctx)
         Error(_) -> {
+          logger.error("Failed to read request body")
           promise.resolve(
             response.new(400)
             |> response.set_body(Text("Failed to read request body"))
@@ -76,6 +79,7 @@ pub fn fetch(
       }
     }
     _ -> {
+      logger.warn("Method not allowed: " <> http.method_to_string(request.method))
       promise.resolve(
         response.new(405)
         |> response.set_body(Text("Method not allowed"))
@@ -89,6 +93,7 @@ fn handle_post_body(body: String, ctx: WorkerContext) -> Promise(JsResponse) {
   case json.parse(body, mcp_request_decoder()) {
     Ok(mcp_req) -> handle_mcp_request(mcp_req, ctx)
     Error(_) -> {
+      logger.error("Invalid JSON in request body")
       promise.resolve(
         response.new(400)
         |> response.set_body(Text("Invalid JSON"))
@@ -121,14 +126,17 @@ fn handle_mcp_request(
 }
 
 fn get_response_json(req: McpRequest, ctx: WorkerContext) -> Promise(json.Json) {
+  logger.mcp_method(req.method, req.id)
   case req.method {
     "initialize" -> handle_initialize(req, ctx)
     "tools/list" -> handle_tools_list(req)
     "tools/call" -> handle_tool_call(req, ctx)
     "resources/list" -> promise.resolve(handle_resources_list(req))
     "resources/read" -> handle_resource_read(req, ctx)
-    _ ->
+    _ -> {
+      logger.warn("Unknown MCP method: " <> req.method)
       promise.resolve(create_error_response(req.id, -32_601, "Method not found"))
+    }
   }
 }
 
@@ -282,25 +290,30 @@ fn tool_definition(
 fn handle_tool_call(req: McpRequest, ctx: WorkerContext) -> Promise(json.Json) {
   case req.params {
     CallToolParams(name: tool_name, arguments: arguments) -> {
+      logger.tool_call(tool_name)
       case tool_name {
         "search_packages" -> handle_search_packages(req.id, arguments, ctx)
         "get_package_info" -> handle_get_package_info(req.id, arguments, ctx)
         "get_modules" -> handle_get_modules(req.id, arguments, ctx)
         "get_module_info" -> handle_get_module_info(req.id, arguments, ctx)
-        _ ->
+        _ -> {
+          logger.warn("Unknown tool requested: " <> tool_name)
           promise.resolve(create_error_response(
             req.id,
             -32_602,
             "Unknown tool: " <> tool_name,
           ))
+        }
       }
     }
-    _ ->
+    _ -> {
+      logger.error("Invalid params for tools/call")
       promise.resolve(create_error_response(
         req.id,
         -32_602,
         "Invalid params for tools/call",
       ))
+    }
   }
 }
 
@@ -382,12 +395,16 @@ fn handle_resource_read(
                 ),
               ])
             }
-            Error(err) ->
+            Error(err) -> {
+              logger.error(
+                "Failed to list packages: " <> hex_client.describe_error(err),
+              )
               create_error_response(
                 req.id,
                 -32_603,
                 "Failed to list packages: " <> hex_client.describe_error(err),
               )
+            }
           }
         }
         _ ->
@@ -427,6 +444,7 @@ fn handle_search_packages(
           use cached <- promise.await(cache.get(db, cache_key, now))
           case cached {
             Some(cached_json) -> {
+              logger.cache_hit(cache_key)
               // Cache hit - parse and return
               case
                 json.parse(
@@ -440,7 +458,10 @@ fn handle_search_packages(
                 Error(_) -> fetch_and_cache_search(id, query, ctx)
               }
             }
-            None -> fetch_and_cache_search(id, query, ctx)
+            None -> {
+              logger.cache_miss(cache_key)
+              fetch_and_cache_search(id, query, ctx)
+            }
           }
         }
         None -> fetch_and_cache_search(id, query, ctx)
@@ -468,6 +489,7 @@ fn fetch_and_cache_search(
         Some(db) -> {
           let cache_key = cache.package_search_key(query)
           let cache_value = encode_search_result(search_result)
+          logger.cache_write(cache_key)
           schedule_background(
             ctx,
             cache.set(
@@ -483,12 +505,14 @@ fn fetch_and_cache_search(
       }
       format_search_result(id, query, search_result)
     }
-    Error(err) ->
+    Error(err) -> {
+      logger.error("Search failed: " <> hex_client.describe_error(err))
       create_error_response(
         id,
         -32_603,
         "Search failed: " <> hex_client.describe_error(err),
       )
+    }
   }
 }
 
@@ -550,12 +574,16 @@ fn handle_get_package_info(
           use cached <- promise.await(cache.get(db, cache_key, now))
           case cached {
             Some(cached_json) -> {
+              logger.cache_hit(cache_key)
               case json.parse(cached_json, package_decoder()) {
                 Ok(pkg) -> promise.resolve(format_package_info(id, pkg))
                 Error(_) -> fetch_and_cache_package_info(id, package_name, ctx)
               }
             }
-            None -> fetch_and_cache_package_info(id, package_name, ctx)
+            None -> {
+              logger.cache_miss(cache_key)
+              fetch_and_cache_package_info(id, package_name, ctx)
+            }
           }
         }
         None -> fetch_and_cache_package_info(id, package_name, ctx)
@@ -582,6 +610,7 @@ fn fetch_and_cache_package_info(
         Some(db) -> {
           let cache_key = cache.package_info_key(package_name)
           let cache_value = encode_package(pkg)
+          logger.cache_write(cache_key)
           schedule_background(
             ctx,
             cache.set(
@@ -597,12 +626,14 @@ fn fetch_and_cache_package_info(
       }
       format_package_info(id, pkg)
     }
-    Error(err) ->
+    Error(err) -> {
+      logger.error("Package info failed: " <> hex_client.describe_error(err))
       create_error_response(
         id,
         -32_603,
         "Package info failed: " <> hex_client.describe_error(err),
       )
+    }
   }
 }
 
@@ -638,6 +669,7 @@ fn handle_get_modules(
           use cached <- promise.await(cache.get(db, cache_key, now))
           case cached {
             Some(cached_json) -> {
+              logger.cache_hit(cache_key)
               case interface_parser.parse_package_interface(cached_json) {
                 Ok(interface) ->
                   promise.resolve(format_modules(id, package_name, interface))
@@ -645,7 +677,10 @@ fn handle_get_modules(
                   fetch_and_cache_interface_for_modules(id, package_name, ctx)
               }
             }
-            None -> fetch_and_cache_interface_for_modules(id, package_name, ctx)
+            None -> {
+              logger.cache_miss(cache_key)
+              fetch_and_cache_interface_for_modules(id, package_name, ctx)
+            }
           }
         }
         None -> fetch_and_cache_interface_for_modules(id, package_name, ctx)
@@ -673,13 +708,17 @@ fn fetch_and_cache_interface_for_modules(
       // For now, we skip caching here since we don't have the raw JSON
       format_modules(id, package_name, interface)
     }
-    Error(err) ->
+    Error(err) -> {
+      logger.error(
+        "Failed to fetch package interface: " <> hex_client.describe_error(err),
+      )
       create_error_response(
         id,
         -32_603,
         "Failed to fetch package interface from hexdocs.pm: "
           <> hex_client.describe_error(err),
       )
+    }
   }
 }
 
@@ -748,17 +787,24 @@ fn handle_get_module_info(
           case interface_parser.get_module_info(interface, module_name) {
             Ok(module_info) ->
               format_module_info(id, package_name, module_name, module_info)
-            Error(err) ->
+            Error(err) -> {
+              logger.warn("Module not found: " <> err)
               create_error_response(id, -32_603, "Module not found: " <> err)
+            }
           }
         }
-        Error(err) ->
+        Error(err) -> {
+          logger.error(
+            "Failed to fetch package interface: "
+              <> hex_client.describe_error(err),
+          )
           create_error_response(
             id,
             -32_603,
             "Failed to fetch package interface: "
               <> hex_client.describe_error(err),
           )
+        }
       }
     }
     _ ->
