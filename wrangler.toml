@@ -14,4 +14,8 @@ database_id = "d52e04bf-5716-419a-a159-f64919993d45"
 # Uncomment to add a custom domain
 # [routes]
 # pattern = "your-domain.com/*"
-# zone_name = "your-domain.com"
+# zone_name =[observability]
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true
