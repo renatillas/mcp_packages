@@ -19,25 +19,35 @@ pub const interface_ttl = 86_400
 /// Initialize the cache tables (run once)
 pub fn init_schema(db: Database) -> Promise(Result(Nil, String)) {
   logger.debug("Initializing cache schema...")
-  let sql =
-    "
-    CREATE TABLE IF NOT EXISTS cache (
+
+  let create_table_sql =
+    "CREATE TABLE IF NOT EXISTS cache (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL,
       expires_at INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at);
-    "
+    )"
 
-  use result <- promise.map(d1.exec(db, sql))
-  case result {
+  let create_index_sql =
+    "CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at)"
+
+  use table_result <- promise.await(d1.exec(db, create_table_sql))
+  case table_result {
     Ok(_) -> {
-      logger.info("Cache schema initialized successfully")
-      Ok(Nil)
+      use index_result <- promise.map(d1.exec(db, create_index_sql))
+      case index_result {
+        Ok(_) -> {
+          logger.info("Cache schema initialized successfully")
+          Ok(Nil)
+        }
+        Error(err) -> {
+          logger.error("Failed to create cache index: " <> err)
+          Error(err)
+        }
+      }
     }
     Error(err) -> {
-      logger.error("Failed to initialize cache schema: " <> err)
-      Error(err)
+      logger.error("Failed to create cache table: " <> err)
+      promise.resolve(Error(err))
     }
   }
 }
