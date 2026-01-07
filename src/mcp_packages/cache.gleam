@@ -16,42 +16,6 @@ pub const default_ttl = 3600
 /// Package interface TTL (24 hours - they don't change often)
 pub const interface_ttl = 86_400
 
-/// Initialize the cache tables (run once)
-pub fn init_schema(db: Database) -> Promise(Result(Nil, String)) {
-  logger.debug("Initializing cache schema...")
-
-  let create_table_sql =
-    "CREATE TABLE IF NOT EXISTS cache (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL,
-      expires_at INTEGER NOT NULL
-    )"
-
-  let create_index_sql =
-    "CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at)"
-
-  use table_result <- promise.await(d1.exec(db, create_table_sql))
-  case table_result {
-    Ok(_) -> {
-      use index_result <- promise.map(d1.exec(db, create_index_sql))
-      case index_result {
-        Ok(_) -> {
-          logger.info("Cache schema initialized successfully")
-          Ok(Nil)
-        }
-        Error(err) -> {
-          logger.error("Failed to create cache index: " <> err)
-          Error(err)
-        }
-      }
-    }
-    Error(err) -> {
-      logger.error("Failed to create cache table: " <> err)
-      promise.resolve(Error(err))
-    }
-  }
-}
-
 /// Get a cached value if it exists and hasn't expired
 pub fn get(
   db: Database,

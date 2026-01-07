@@ -38,6 +38,7 @@ pub type ToolArguments {
   SearchArguments(query: String)
   PackageArguments(package_name: String)
   ModuleArguments(package_name: String, module_name: String)
+  PackageSearchArguments(package_name: String, query: String)
 }
 
 /// Worker context with database and execution context
@@ -161,15 +162,7 @@ fn schedule_background(ctx: WorkerContext, task: Promise(a)) -> Nil {
 // MCP Protocol Handlers
 // ============================================================================
 
-fn handle_initialize(req: McpRequest, ctx: WorkerContext) -> Promise(json.Json) {
-  // Initialize cache schema in background if we have a database
-  case ctx.db {
-    Some(db) -> {
-      schedule_background(ctx, cache.init_schema(db))
-    }
-    None -> Nil
-  }
-
+fn handle_initialize(req: McpRequest, _ctx: WorkerContext) -> Promise(json.Json) {
   promise.resolve(
     json.object([
       #("jsonrpc", json.string("2.0")),
@@ -240,6 +233,37 @@ fn handle_tools_list(req: McpRequest) -> Promise(json.Json) {
         ),
       ],
     ),
+    tool_definition(
+      "search_functions",
+      "Search for functions within a package by name or documentation",
+      [
+        #("package_name", "string", "Name of the package to search in", True),
+        #(
+          "query",
+          "string",
+          "Search query to match against function names and documentation",
+          True,
+        ),
+      ],
+    ),
+    tool_definition(
+      "search_types",
+      "Search for types within a package by name or documentation",
+      [
+        #("package_name", "string", "Name of the package to search in", True),
+        #(
+          "query",
+          "string",
+          "Search query to match against type names and documentation",
+          True,
+        ),
+      ],
+    ),
+    tool_definition(
+      "get_package_releases",
+      "Get all releases for a package with version history and retirement info",
+      [#("package_name", "string", "Name of the package", True)],
+    ),
   ]
 
   json.object([
@@ -296,6 +320,9 @@ fn handle_tool_call(req: McpRequest, ctx: WorkerContext) -> Promise(json.Json) {
         "get_package_info" -> handle_get_package_info(req.id, arguments, ctx)
         "get_modules" -> handle_get_modules(req.id, arguments, ctx)
         "get_module_info" -> handle_get_module_info(req.id, arguments, ctx)
+        "search_functions" -> handle_search_functions(req.id, arguments, ctx)
+        "search_types" -> handle_search_types(req.id, arguments, ctx)
+        "get_package_releases" -> handle_get_package_releases(req.id, arguments, ctx)
         _ -> {
           logger.warn("Unknown tool requested: " <> tool_name)
           promise.resolve(create_error_response(
@@ -529,6 +556,9 @@ fn format_search_result(
         #("description", json.string(pkg.description)),
         #("downloads", json.int(pkg.downloads)),
         #("docs_url", json.string(pkg.docs_url)),
+        #("licenses", json.array(pkg.licenses, json.string)),
+        #("repository_url", json.string(pkg.repository_url)),
+        #("hex_url", json.string(pkg.hex_url)),
       ])
     })
 
@@ -635,7 +665,126 @@ fn fetch_and_cache_package_info(
   }
 }
 
+fn handle_get_package_releases(
+  id: String,
+  arguments: ToolArguments,
+  _ctx: WorkerContext,
+) -> Promise(json.Json) {
+  case arguments {
+    PackageArguments(package_name: package_name) -> {
+      use result <- promise.map(hex_client.get_package_releases(package_name))
+      case result {
+        Ok(releases_info) -> format_package_releases(id, releases_info)
+        Error(err) -> {
+          logger.error(
+            "Failed to fetch releases: " <> hex_client.describe_error(err),
+          )
+          create_error_response(
+            id,
+            -32_603,
+            "Failed to fetch releases: " <> hex_client.describe_error(err),
+          )
+        }
+      }
+    }
+    _ ->
+      promise.resolve(create_error_response(
+        id,
+        -32_602,
+        "Invalid arguments for get_package_releases",
+      ))
+  }
+}
+
+fn format_package_releases(
+  id: String,
+  releases_info: hex_client.PackageReleases,
+) -> json.Json {
+  let releases_json =
+    releases_info.releases
+    |> list.map(fn(release) {
+      let base_fields = [
+        #("version", json.string(release.version)),
+        #("inserted_at", json.string(release.inserted_at)),
+        #("has_docs", json.bool(release.has_docs)),
+      ]
+      let fields = case release.retirement {
+        Some(retirement) ->
+          list.append(base_fields, [
+            #("retired", json.bool(True)),
+            #("retirement_reason", json.string(retirement.reason)),
+            #("retirement_message", json.string(retirement.message)),
+          ])
+        None -> list.append(base_fields, [#("retired", json.bool(False))])
+      }
+      json.object(fields)
+    })
+
+  let releases_text =
+    releases_info.releases
+    |> list.map(fn(release) {
+      let retired_notice = case release.retirement {
+        Some(retirement) ->
+          " [RETIRED: "
+          <> retirement.reason
+          <> case retirement.message {
+            "" -> ""
+            msg -> " - " <> msg
+          }
+          <> "]"
+        None -> ""
+      }
+      let docs_notice = case release.has_docs {
+        True -> ""
+        False -> " (no docs)"
+      }
+      "- v"
+      <> release.version
+      <> " ("
+      <> string.slice(release.inserted_at, 0, 10)
+      <> ")"
+      <> retired_notice
+      <> docs_notice
+    })
+    |> string.join("\n")
+
+  let retired_count =
+    releases_info.releases
+    |> list.filter(fn(r) { option.is_some(r.retirement) })
+    |> list.length
+
+  create_tool_result(
+    id,
+    "Package: "
+      <> releases_info.name
+      <> "\nTotal releases: "
+      <> int.to_string(list.length(releases_info.releases))
+      <> "\nRetired releases: "
+      <> int.to_string(retired_count)
+      <> "\n\nVersions:\n"
+      <> releases_text,
+    Some(
+      json.object([
+        #("name", json.string(releases_info.name)),
+        #("total", json.int(list.length(releases_info.releases))),
+        #("retired_count", json.int(retired_count)),
+        #("releases", json.preprocessed_array(releases_json)),
+      ]),
+    ),
+  )
+}
+
 fn format_package_info(id: String, pkg: hex_client.Package) -> json.Json {
+  let licenses_text = case pkg.licenses {
+    [] -> "Not specified"
+    licenses -> string.join(licenses, ", ")
+  }
+
+  let repo_text = case pkg.repository_url {
+    "" -> "Not specified"
+    url -> url
+  }
+
   create_tool_result(
     id,
     "Package: "
@@ -646,9 +795,26 @@ fn format_package_info(id: String, pkg: hex_client.Package) -> json.Json {
       <> pkg.description
       <> "\nDownloads: "
       <> int.to_string(pkg.downloads)
+      <> "\nLicenses: "
+      <> licenses_text
+      <> "\nRepository: "
+      <> repo_text
       <> "\nDocs: "
-      <> pkg.docs_url,
-    None,
+      <> pkg.docs_url
+      <> "\nHex: "
+      <> pkg.hex_url,
+    Some(
+      json.object([
+        #("name", json.string(pkg.name)),
+        #("version", json.string(pkg.version)),
+        #("description", json.string(pkg.description)),
+        #("downloads", json.int(pkg.downloads)),
+        #("licenses", json.array(pkg.licenses, json.string)),
+        #("repository_url", json.string(pkg.repository_url)),
+        #("docs_url", json.string(pkg.docs_url)),
+        #("hex_url", json.string(pkg.hex_url)),
+      ]),
+    ),
   )
 }
 
@@ -731,11 +897,16 @@ fn format_modules(
       let types_info =
         module_info.types
         |> list.map(fn(type_info) {
-          json.object([
+          let base_fields = [
             #("name", json.string(type_info.name)),
             #("signature", json.string(type_info.signature)),
             #("type_kind", json.string(type_info.type_kind)),
-          ])
+          ]
+          let fields = case type_info.deprecation {
+            Some(msg) -> list.append(base_fields, [#("deprecation", json.string(msg))])
+            None -> base_fields
+          }
+          json.object(fields)
         })
 
       json.object([
@@ -743,6 +914,8 @@ fn format_modules(
         #("documentation", json.string(module_info.documentation)),
         #("functions_count", json.int(list.length(module_info.functions))),
         #("types_count", json.int(list.length(module_info.types))),
+        #("constants_count", json.int(list.length(module_info.constants))),
+        #("type_aliases_count", json.int(list.length(module_info.type_aliases))),
         #("types", json.preprocessed_array(types_info)),
       ])
     })
@@ -750,15 +923,33 @@ fn format_modules(
   let module_list_text =
     interface.modules
     |> list.map(fn(m) {
+      let extras = case list.length(m.constants), list.length(m.type_aliases) {
+        0, 0 -> ""
+        c, 0 -> ", " <> int.to_string(c) <> " constants"
+        0, a -> ", " <> int.to_string(a) <> " type aliases"
+        c, a ->
+          ", "
+          <> int.to_string(c)
+          <> " constants, "
+          <> int.to_string(a)
+          <> " type aliases"
+      }
       "- "
       <> m.name
       <> " ("
       <> int.to_string(list.length(m.functions))
       <> " functions, "
       <> int.to_string(list.length(m.types))
-      <> " types)"
+      <> " types"
+      <> extras
+      <> ")"
     })
     |> string.join("\n")
+
+  let gleam_constraint_text = case interface.gleam_version_constraint {
+    "" -> ""
+    constraint -> "\nGleam version: " <> constraint
+  }
 
   create_tool_result(
     id,
@@ -766,9 +957,17 @@ fn format_modules(
       <> package_name
       <> " (v"
       <> interface.version
-      <> ")\n\nModules:\n"
+      <> ")"
+      <> gleam_constraint_text
+      <> "\n\nModules:\n"
       <> module_list_text,
-    Some(json.object([#("modules", json.preprocessed_array(modules))])),
+    Some(
+      json.object([
+        #("version", json.string(interface.version)),
+        #("gleam_version_constraint", json.string(interface.gleam_version_constraint)),
+        #("modules", json.preprocessed_array(modules)),
+      ]),
+    ),
   )
 }
 
@@ -814,6 +1013,181 @@ fn handle_get_module_info(
   }
 }
 
+fn handle_search_functions(
+  id: String,
+  arguments: ToolArguments,
+  _ctx: WorkerContext,
+) -> Promise(json.Json) {
+  case arguments {
+    PackageSearchArguments(package_name: package_name, query: query) -> {
+      use result <- promise.map(hex_client.fetch_package_interface(package_name))
+      case result {
+        Ok(interface) -> {
+          let functions = interface_parser.search_functions(interface, query)
+          format_function_search_results(id, package_name, query, functions)
+        }
+        Error(err) -> {
+          logger.error(
+            "Failed to fetch package interface: "
+              <> hex_client.describe_error(err),
+          )
+          create_error_response(
+            id,
+            -32_603,
+            "Failed to fetch package interface: "
+              <> hex_client.describe_error(err),
+          )
+        }
+      }
+    }
+    _ ->
+      promise.resolve(create_error_response(
+        id,
+        -32_602,
+        "Invalid arguments for search_functions",
+      ))
+  }
+}
+
+fn format_function_search_results(
+  id: String,
+  package_name: String,
+  query: String,
+  functions: List(interface_parser.FunctionInfo),
+) -> json.Json {
+  let functions_json =
+    functions
+    |> list.map(fn(func) {
+      let impl = func.implementations
+      let base_fields = [
+        #("name", json.string(func.name)),
+        #("signature", json.string(func.signature)),
+        #("documentation", json.string(func.documentation)),
+        #(
+          "implementations",
+          json.object([
+            #("can_run_on_erlang", json.bool(impl.can_run_on_erlang)),
+            #("can_run_on_javascript", json.bool(impl.can_run_on_javascript)),
+          ]),
+        ),
+      ]
+      let fields = case func.deprecation {
+        Some(msg) -> list.append(base_fields, [#("deprecation", json.string(msg))])
+        None -> base_fields
+      }
+      json.object(fields)
+    })
+
+  let functions_text =
+    functions
+    |> list.map(fn(func) {
+      let deprecation_notice = case func.deprecation {
+        Some(msg) -> " [DEPRECATED: " <> msg <> "]"
+        None -> ""
+      }
+      "- " <> func.signature <> deprecation_notice
+    })
+    |> string.join("\n")
+
+  let count = list.length(functions)
+  create_tool_result(
+    id,
+    "Found "
+      <> int.to_string(count)
+      <> " functions matching '"
+      <> query
+      <> "' in "
+      <> package_name
+      <> ":\n\n"
+      <> functions_text,
+    Some(json.object([#("functions", json.preprocessed_array(functions_json))])),
+  )
+}
+
+fn handle_search_types(
+  id: String,
+  arguments: ToolArguments,
+  _ctx: WorkerContext,
+) -> Promise(json.Json) {
+  case arguments {
+    PackageSearchArguments(package_name: package_name, query: query) -> {
+      use result <- promise.map(hex_client.fetch_package_interface(package_name))
+      case result {
+        Ok(interface) -> {
+          let types = interface_parser.search_types(interface, query)
+          format_type_search_results(id, package_name, query, types)
+        }
+        Error(err) -> {
+          logger.error(
+            "Failed to fetch package interface: "
+              <> hex_client.describe_error(err),
+          )
+          create_error_response(
+            id,
+            -32_603,
+            "Failed to fetch package interface: "
+              <> hex_client.describe_error(err),
+          )
+        }
+      }
+    }
+    _ ->
+      promise.resolve(create_error_response(
+        id,
+        -32_602,
+        "Invalid arguments for search_types",
+      ))
+  }
+}
+
+fn format_type_search_results(
+  id: String,
+  package_name: String,
+  query: String,
+  types: List(interface_parser.TypeInfo),
+) -> json.Json {
+  let types_json =
+    types
+    |> list.map(fn(type_info) {
+      let base_fields = [
+        #("name", json.string(type_info.name)),
+        #("signature", json.string(type_info.signature)),
+        #("type_kind", json.string(type_info.type_kind)),
+        #("documentation", json.string(type_info.documentation)),
+      ]
+      let fields = case type_info.deprecation {
+        Some(msg) -> list.append(base_fields, [#("deprecation", json.string(msg))])
+        None -> base_fields
+      }
+      json.object(fields)
+    })
+
+  let types_text =
+    types
+    |> list.map(fn(t) {
+      let deprecation_notice = case t.deprecation {
+        Some(msg) -> " [DEPRECATED: " <> msg <> "]"
+        None -> ""
+      }
+      "- " <> t.signature <> deprecation_notice
+    })
+    |> string.join("\n")
+
+  let count = list.length(types)
+  create_tool_result(
+    id,
+    "Found "
+      <> int.to_string(count)
+      <> " types matching '"
+      <> query
+      <> "' in "
+      <> package_name
+      <> ":\n\n"
+      <> types_text,
+    Some(json.object([#("types", json.preprocessed_array(types_json))])),
+  )
+}
+
 fn format_module_info(
   id: String,
   package_name: String,
@@ -823,7 +1197,8 @@ fn format_module_info(
   let functions =
     module_info.functions
     |> list.map(fn(func) {
-      json.object([
+      let impl = func.implementations
+      let base_fields = [
         #("name", json.string(func.name)),
         #("signature", json.string(func.signature)),
         #("documentation", json.string(func.documentation)),
@@ -838,26 +1213,57 @@ fn format_module_info(
             }),
           ),
         ),
-      ])
+        #(
+          "implementations",
+          json.object([
+            #("gleam", json.bool(impl.gleam)),
+            #("uses_erlang_externals", json.bool(impl.uses_erlang_externals)),
+            #("uses_javascript_externals", json.bool(impl.uses_javascript_externals)),
+            #("can_run_on_erlang", json.bool(impl.can_run_on_erlang)),
+            #("can_run_on_javascript", json.bool(impl.can_run_on_javascript)),
+          ]),
+        ),
+      ]
+      let fields = case func.deprecation {
+        Some(msg) -> list.append(base_fields, [#("deprecation", json.string(msg))])
+        None -> base_fields
+      }
+      json.object(fields)
     })
 
   let types =
     module_info.types
     |> list.map(fn(type_info) {
-      json.object([
+      let base_fields = [
         #("name", json.string(type_info.name)),
         #("signature", json.string(type_info.signature)),
         #("type_kind", json.string(type_info.type_kind)),
         #("documentation", json.string(type_info.documentation)),
-      ])
+      ]
+      let fields = case type_info.deprecation {
+        Some(msg) -> list.append(base_fields, [#("deprecation", json.string(msg))])
+        None -> base_fields
+      }
+      json.object(fields)
     })
 
   let functions_text =
     module_info.functions
     |> list.map(fn(func) {
+      let deprecation_notice = case func.deprecation {
+        Some(msg) -> " [DEPRECATED: " <> msg <> "]"
+        None -> ""
+      }
+      let impl = func.implementations
+      let platform_notice = case impl.can_run_on_erlang, impl.can_run_on_javascript {
+        True, True -> ""
+        True, False -> " [Erlang only]"
+        False, True -> " [JavaScript only]"
+        False, False -> " [No runtime support]"
+      }
       case func.documentation {
-        "" -> "### " <> func.signature
-        doc -> "### " <> func.signature <> "\n" <> doc
+        "" -> "### " <> func.signature <> deprecation_notice <> platform_notice
+        doc -> "### " <> func.signature <> deprecation_notice <> platform_notice <> "\n" <> doc
       }
     })
     |> string.join("\n\n")
@@ -865,12 +1271,82 @@ fn format_module_info(
   let types_text =
     module_info.types
     |> list.map(fn(t) {
+      let deprecation_notice = case t.deprecation {
+        Some(msg) -> " [DEPRECATED: " <> msg <> "]"
+        None -> ""
+      }
       case t.documentation {
-        "" -> "### " <> t.signature
-        doc -> "### " <> t.signature <> "\n" <> doc
+        "" -> "### " <> t.signature <> deprecation_notice
+        doc -> "### " <> t.signature <> deprecation_notice <> "\n" <> doc
       }
     })
     |> string.join("\n\n")
+
+  let constants =
+    module_info.constants
+    |> list.map(fn(c) {
+      json.object([
+        #("name", json.string(c.name)),
+        #("type", json.string(c.type_name)),
+        #("documentation", json.string(c.documentation)),
+      ])
+    })
+
+  let constants_text = case module_info.constants {
+    [] -> ""
+    consts ->
+      "\n\n## Constants ("
+      <> int.to_string(list.length(consts))
+      <> "):\n"
+      <> {
+        consts
+        |> list.map(fn(c) {
+          case c.documentation {
+            "" -> "### " <> c.name <> ": " <> c.type_name
+            doc -> "### " <> c.name <> ": " <> c.type_name <> "\n" <> doc
+          }
+        })
+        |> string.join("\n\n")
+      }
+  }
+
+  let type_aliases =
+    module_info.type_aliases
+    |> list.map(fn(ta) {
+      let base_fields = [
+        #("name", json.string(ta.name)),
+        #("alias_for", json.string(ta.type_name)),
+        #("documentation", json.string(ta.documentation)),
+      ]
+      let fields = case ta.deprecation {
+        Some(msg) -> list.append(base_fields, [#("deprecation", json.string(msg))])
+        None -> base_fields
+      }
+      json.object(fields)
+    })
+
+  let type_aliases_text = case module_info.type_aliases {
+    [] -> ""
+    aliases ->
+      "\n\n## Type Aliases ("
+      <> int.to_string(list.length(aliases))
+      <> "):\n"
+      <> {
+        aliases
+        |> list.map(fn(ta) {
+          let deprecation_notice = case ta.deprecation {
+            Some(msg) -> " [DEPRECATED: " <> msg <> "]"
+            None -> ""
+          }
+          case ta.documentation {
+            "" -> "### type " <> ta.name <> " = " <> ta.type_name <> deprecation_notice
+            doc ->
+              "### type " <> ta.name <> " = " <> ta.type_name <> deprecation_notice <> "\n" <> doc
+          }
+        })
+        |> string.join("\n\n")
+      }
+  }
 
   let text_content =
     "Module: "
@@ -887,6 +1363,8 @@ fn format_module_info(
     <> int.to_string(list.length(module_info.types))
     <> "):\n"
     <> types_text
+    <> constants_text
+    <> type_aliases_text
 
   json.object([
     #("jsonrpc", json.string("2.0")),
@@ -905,6 +1383,8 @@ fn format_module_info(
         ),
         #("functions", json.preprocessed_array(functions)),
         #("types", json.preprocessed_array(types)),
+        #("constants", json.preprocessed_array(constants)),
+        #("type_aliases", json.preprocessed_array(type_aliases)),
       ]),
     ),
   ])
@@ -967,6 +1447,9 @@ fn encode_package(pkg: hex_client.Package) -> String {
       #("description", json.string(pkg.description)),
       #("downloads", json.int(pkg.downloads)),
       #("docs_url", json.string(pkg.docs_url)),
+      #("licenses", json.array(pkg.licenses, json.string)),
+      #("repository_url", json.string(pkg.repository_url)),
+      #("hex_url", json.string(pkg.hex_url)),
     ]),
   )
 }
@@ -977,12 +1460,18 @@ fn package_decoder() -> decode.Decoder(hex_client.Package) {
   use description <- decode.field("description", decode.string)
   use downloads <- decode.field("downloads", decode.int)
   use docs_url <- decode.field("docs_url", decode.string)
+  use licenses <- decode.optional_field("licenses", [], decode.list(decode.string))
+  use repository_url <- decode.optional_field("repository_url", "", decode.string)
+  use hex_url <- decode.optional_field("hex_url", "", decode.string)
   decode.success(hex_client.Package(
     name: name,
     version: version,
     description: description,
     downloads: downloads,
     docs_url: docs_url,
+    licenses: licenses,
+    repository_url: repository_url,
+    hex_url: hex_url,
   ))
 }
 
@@ -996,6 +1485,9 @@ fn encode_search_result(result: hex_client.PackageSearchResult) -> String {
         #("description", json.string(pkg.description)),
         #("downloads", json.int(pkg.downloads)),
         #("docs_url", json.string(pkg.docs_url)),
+        #("licenses", json.array(pkg.licenses, json.string)),
+        #("repository_url", json.string(pkg.repository_url)),
+        #("hex_url", json.string(pkg.hex_url)),
       ])
     })
 
@@ -1056,7 +1548,7 @@ fn tool_arguments_decoder(tool_name: String) -> decode.Decoder(ToolArguments) {
       use query <- decode.field("query", decode.string)
       decode.success(SearchArguments(query: query))
     }
-    "get_package_info" | "get_modules" -> {
+    "get_package_info" | "get_modules" | "get_package_releases" -> {
       use package_name <- decode.field("package_name", decode.string)
       decode.success(PackageArguments(package_name: package_name))
     }
@@ -1066,6 +1558,14 @@ fn tool_arguments_decoder(tool_name: String) -> decode.Decoder(ToolArguments) {
       decode.success(ModuleArguments(
         package_name: package_name,
         module_name: module_name,
+      ))
+    }
+    "search_functions" | "search_types" -> {
+      use package_name <- decode.field("package_name", decode.string)
+      use query <- decode.field("query", decode.string)
+      decode.success(PackageSearchArguments(
+        package_name: package_name,
+        query: query,
       ))
     }
     _ -> decode.success(SearchArguments(query: ""))

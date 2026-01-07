@@ -4,10 +4,16 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/json
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/string
 
 pub type PackageInterface {
-  PackageInterface(name: String, version: String, modules: List(ModuleInfo))
+  PackageInterface(
+    name: String,
+    version: String,
+    gleam_version_constraint: String,
+    modules: List(ModuleInfo),
+  )
 }
 
 pub type ModuleInfo {
@@ -16,6 +22,27 @@ pub type ModuleInfo {
     documentation: String,
     functions: List(FunctionInfo),
     types: List(TypeInfo),
+    constants: List(ConstantInfo),
+    type_aliases: List(TypeAliasInfo),
+  )
+}
+
+/// A constant value exported from a module
+pub type ConstantInfo {
+  ConstantInfo(
+    name: String,
+    documentation: String,
+    type_name: String,
+  )
+}
+
+/// A type alias definition
+pub type TypeAliasInfo {
+  TypeAliasInfo(
+    name: String,
+    documentation: String,
+    type_name: String,
+    deprecation: Option(String),
   )
 }
 
@@ -25,6 +52,7 @@ pub type TypeInfo {
     documentation: String,
     signature: String,
     type_kind: String,
+    deprecation: Option(String),
   )
 }
 
@@ -34,6 +62,19 @@ pub type FunctionInfo {
     documentation: String,
     signature: String,
     parameters: List(ParameterInfo),
+    deprecation: Option(String),
+    implementations: Implementations,
+  )
+}
+
+/// Platform compatibility info for a function
+pub type Implementations {
+  Implementations(
+    gleam: Bool,
+    uses_erlang_externals: Bool,
+    uses_javascript_externals: Bool,
+    can_run_on_erlang: Bool,
+    can_run_on_javascript: Bool,
   )
 }
 
@@ -46,6 +87,8 @@ type ModuleData {
     documentation: String,
     functions: Dict(String, dynamic.Dynamic),
     types: Dict(String, dynamic.Dynamic),
+    constants: Dict(String, dynamic.Dynamic),
+    type_aliases: Dict(String, dynamic.Dynamic),
   )
 }
 
@@ -62,6 +105,11 @@ pub fn parse_package_interface(
 fn interface_decoder() -> decode.Decoder(PackageInterface) {
   use name <- decode.field("name", decode.string)
   use version <- decode.field("version", decode.string)
+  use gleam_version_constraint <- decode.optional_field(
+    "gleam-version-constraint",
+    "",
+    decode.string,
+  )
   use modules_dict <- decode.field(
     "modules",
     decode.dict(decode.string, module_data_decoder()),
@@ -77,12 +125,15 @@ fn interface_decoder() -> decode.Decoder(PackageInterface) {
         documentation: module_data.documentation,
         functions: extract_functions(module_data.functions),
         types: extract_types(module_data.types),
+        constants: extract_constants(module_data.constants),
+        type_aliases: extract_type_aliases(module_data.type_aliases),
       )
     })
 
   decode.success(PackageInterface(
     name: name,
     version: version,
+    gleam_version_constraint: gleam_version_constraint,
     modules: modules,
   ))
 }
@@ -102,6 +153,16 @@ fn module_data_decoder() -> decode.Decoder(ModuleData) {
     dict.new(),
     decode.dict(decode.string, decode.dynamic),
   )
+  use constants <- decode.optional_field(
+    "constants",
+    dict.new(),
+    decode.dict(decode.string, decode.dynamic),
+  )
+  use type_aliases <- decode.optional_field(
+    "type-aliases",
+    dict.new(),
+    decode.dict(decode.string, decode.dynamic),
+  )
 
   let doc_string = string.join(documentation, "\n")
 
@@ -109,6 +170,8 @@ fn module_data_decoder() -> decode.Decoder(ModuleData) {
     documentation: doc_string,
     functions: functions,
     types: types,
+    constants: constants,
+    type_aliases: type_aliases,
   ))
 }
 
@@ -143,6 +206,15 @@ fn extract_functions(
       Error(_) -> "unknown"
     }
 
+    let deprecation = case
+      decode.run(func_data, decode.at(["deprecation"], decode.string))
+    {
+      Ok(msg) -> Some(msg)
+      Error(_) -> None
+    }
+
+    let implementations = extract_implementations(func_data)
+
     let signature = build_function_signature(func_name, parameters, return_type)
 
     FunctionInfo(
@@ -150,6 +222,8 @@ fn extract_functions(
       documentation: documentation,
       signature: signature,
       parameters: parameters,
+      deprecation: deprecation,
+      implementations: implementations,
     )
   })
 }
@@ -173,6 +247,66 @@ fn extract_parameters(params_list: List(dynamic.Dynamic)) -> List(ParameterInfo)
 
     ParameterInfo(label: label, type_name: type_name)
   })
+}
+
+fn extract_implementations(func_data: dynamic.Dynamic) -> Implementations {
+  let gleam = case
+    decode.run(
+      func_data,
+      decode.at(["implementations", "gleam"], decode.bool),
+    )
+  {
+    Ok(val) -> val
+    Error(_) -> False
+  }
+
+  let uses_erlang_externals = case
+    decode.run(
+      func_data,
+      decode.at(["implementations", "uses-erlang-externals"], decode.bool),
+    )
+  {
+    Ok(val) -> val
+    Error(_) -> False
+  }
+
+  let uses_javascript_externals = case
+    decode.run(
+      func_data,
+      decode.at(["implementations", "uses-javascript-externals"], decode.bool),
+    )
+  {
+    Ok(val) -> val
+    Error(_) -> False
+  }
+
+  let can_run_on_erlang = case
+    decode.run(
+      func_data,
+      decode.at(["implementations", "can-run-on-erlang"], decode.bool),
+    )
+  {
+    Ok(val) -> val
+    Error(_) -> True
+  }
+
+  let can_run_on_javascript = case
+    decode.run(
+      func_data,
+      decode.at(["implementations", "can-run-on-javascript"], decode.bool),
+    )
+  {
+    Ok(val) -> val
+    Error(_) -> True
+  }
+
+  Implementations(
+    gleam: gleam,
+    uses_erlang_externals: uses_erlang_externals,
+    uses_javascript_externals: uses_javascript_externals,
+    can_run_on_erlang: can_run_on_erlang,
+    can_run_on_javascript: can_run_on_javascript,
+  )
 }
 
 fn extract_type_name(type_dynamic: dynamic.Dynamic) -> String {
@@ -328,6 +462,13 @@ fn extract_types(types_dict: Dict(String, dynamic.Dynamic)) -> List(TypeInfo) {
       Error(_) -> "unknown"
     }
 
+    let deprecation = case
+      decode.run(type_data, decode.at(["deprecation"], decode.string))
+    {
+      Ok(msg) -> Some(msg)
+      Error(_) -> None
+    }
+
     let signature = build_type_signature(type_name, type_data)
 
     TypeInfo(
@@ -335,6 +476,7 @@ fn extract_types(types_dict: Dict(String, dynamic.Dynamic)) -> List(TypeInfo) {
       documentation: documentation,
       signature: signature,
       type_kind: type_kind,
+      deprecation: deprecation,
     )
   })
 }
@@ -429,6 +571,72 @@ fn extract_constructors(constructors_list: List(dynamic.Dynamic)) -> String {
     })
 
   string.join(constructor_strs, "\n  ")
+}
+
+fn extract_constants(
+  constants_dict: Dict(String, dynamic.Dynamic),
+) -> List(ConstantInfo) {
+  constants_dict
+  |> dict.to_list()
+  |> list.map(fn(entry) {
+    let #(const_name, const_data) = entry
+    let documentation = case
+      decode.run(const_data, decode.at(["documentation"], decode.string))
+    {
+      Ok(doc) -> doc
+      Error(_) -> ""
+    }
+
+    let type_name = case
+      decode.run(const_data, decode.at(["type"], decode.dynamic))
+    {
+      Ok(type_dynamic) -> extract_type_name(type_dynamic)
+      Error(_) -> "unknown"
+    }
+
+    ConstantInfo(
+      name: const_name,
+      documentation: documentation,
+      type_name: type_name,
+    )
+  })
+}
+
+fn extract_type_aliases(
+  type_aliases_dict: Dict(String, dynamic.Dynamic),
+) -> List(TypeAliasInfo) {
+  type_aliases_dict
+  |> dict.to_list()
+  |> list.map(fn(entry) {
+    let #(alias_name, alias_data) = entry
+    let documentation = case
+      decode.run(alias_data, decode.at(["documentation"], decode.string))
+    {
+      Ok(doc) -> doc
+      Error(_) -> ""
+    }
+
+    let type_name = case
+      decode.run(alias_data, decode.at(["alias"], decode.dynamic))
+    {
+      Ok(type_dynamic) -> extract_type_name(type_dynamic)
+      Error(_) -> "unknown"
+    }
+
+    let deprecation = case
+      decode.run(alias_data, decode.at(["deprecation"], decode.string))
+    {
+      Ok(msg) -> Some(msg)
+      Error(_) -> None
+    }
+
+    TypeAliasInfo(
+      name: alias_name,
+      documentation: documentation,
+      type_name: type_name,
+      deprecation: deprecation,
+    )
+  })
 }
 
 pub fn get_module_info(
