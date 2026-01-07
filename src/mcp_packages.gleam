@@ -1,16 +1,21 @@
+import conversation.{type JsRequest, type JsResponse, Text}
 import gleam/dynamic
 import gleam/dynamic/decode
 import gleam/http
-import gleam/http/request.{type Request}
-import gleam/http/response.{type Response}
+import gleam/http/response
 import gleam/int
 import gleam/javascript/promise.{type Promise}
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/string
+import mcp_packages/cache
 import mcp_packages/hex_client
 import mcp_packages/interface_parser
+import plinth/cloudflare/bindings
+import plinth/cloudflare/d1.{type Database}
+import plinth/cloudflare/worker.{type Context}
+import plinth/javascript/date
 
 // ============================================================================
 // Types
@@ -34,61 +39,113 @@ pub type ToolArguments {
   ModuleArguments(package_name: String, module_name: String)
 }
 
+/// Worker context with database and execution context
+pub type WorkerContext {
+  WorkerContext(db: Option(Database), ctx: Option(Context))
+}
+
 // ============================================================================
 // Cloudflare Worker Entry Point
 // ============================================================================
 
 /// Main fetch handler for Cloudflare Workers
-/// This is called from the JavaScript entry point
+/// Uses conversation to handle JS <-> Gleam conversions
 pub fn fetch(
-  req: Request(String),
-  _env: dynamic.Dynamic,
-) -> Promise(Response(String)) {
-  case req.method {
-    http.Post -> handle_post(req)
+  js_request: JsRequest,
+  env: dynamic.Dynamic,
+  ctx: Context,
+) -> Promise(JsResponse) {
+  let request = conversation.to_gleam_request(js_request)
+
+  // Extract D1 database from env bindings
+  let db = bindings.d1_database(env, "DB") |> option.from_result
+  let worker_ctx = WorkerContext(db: db, ctx: Some(ctx))
+
+  case request.method {
+    http.Post -> {
+      use body_result <- promise.await(conversation.read_text(request.body))
+      case body_result {
+        Ok(body) -> handle_post_body(body, worker_ctx)
+        Error(_) -> {
+          promise.resolve(
+            response.new(400)
+            |> response.set_body(Text("Failed to read request body"))
+            |> conversation.to_js_response,
+          )
+        }
+      }
+    }
     _ -> {
       promise.resolve(
         response.new(405)
-        |> response.set_body("Method not allowed"),
+        |> response.set_body(Text("Method not allowed"))
+        |> conversation.to_js_response,
       )
     }
   }
 }
 
-fn handle_post(req: Request(String)) -> Promise(Response(String)) {
-  case json.parse(req.body, mcp_request_decoder()) {
-    Ok(mcp_req) -> handle_mcp_request(mcp_req)
+fn handle_post_body(body: String, ctx: WorkerContext) -> Promise(JsResponse) {
+  case json.parse(body, mcp_request_decoder()) {
+    Ok(mcp_req) -> handle_mcp_request(mcp_req, ctx)
     Error(_) -> {
       promise.resolve(
         response.new(400)
-        |> response.set_body("Invalid JSON"),
+        |> response.set_body(Text("Invalid JSON"))
+        |> conversation.to_js_response,
       )
     }
   }
 }
 
-fn handle_mcp_request(req: McpRequest) -> Promise(Response(String)) {
+fn handle_mcp_request(
+  req: McpRequest,
+  ctx: WorkerContext,
+) -> Promise(JsResponse) {
   case req.method {
     "notifications/initialized" -> {
-      promise.resolve(response.new(204) |> response.set_body(""))
+      promise.resolve(
+        response.new(204)
+        |> response.set_body(Text(""))
+        |> conversation.to_js_response,
+      )
     }
     _ -> {
-      use response_json <- promise.map(get_response_json(req))
+      use response_json <- promise.map(get_response_json(req, ctx))
       response.new(200)
       |> response.set_header("content-type", "application/json")
-      |> response.set_body(json.to_string(response_json))
+      |> response.set_body(Text(json.to_string(response_json)))
+      |> conversation.to_js_response
     }
   }
 }
 
-fn get_response_json(req: McpRequest) -> Promise(json.Json) {
+fn get_response_json(req: McpRequest, ctx: WorkerContext) -> Promise(json.Json) {
   case req.method {
-    "initialize" -> promise.resolve(handle_initialize(req))
-    "tools/list" -> promise.resolve(handle_tools_list(req))
-    "tools/call" -> handle_tool_call(req)
+    "initialize" -> handle_initialize(req, ctx)
+    "tools/list" -> handle_tools_list(req)
+    "tools/call" -> handle_tool_call(req, ctx)
     "resources/list" -> promise.resolve(handle_resources_list(req))
-    "resources/read" -> handle_resource_read(req)
-    _ -> promise.resolve(create_error_response(req.id, -32_601, "Method not found"))
+    "resources/read" -> handle_resource_read(req, ctx)
+    _ ->
+      promise.resolve(create_error_response(req.id, -32_601, "Method not found"))
+  }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Get current Unix timestamp in seconds
+fn now_seconds() -> Int {
+  date.now() |> date.get_time |> fn(ms) { ms / 1000 }
+}
+
+/// Schedule a background task using wait_until
+fn schedule_background(ctx: WorkerContext, task: Promise(a)) -> Nil {
+  case ctx.ctx {
+    Some(worker_ctx) -> worker.wait_until(worker_ctx, task)
+    None -> Nil
   }
 }
 
@@ -96,39 +153,56 @@ fn get_response_json(req: McpRequest) -> Promise(json.Json) {
 // MCP Protocol Handlers
 // ============================================================================
 
-fn handle_initialize(req: McpRequest) -> json.Json {
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("id", json.string(req.id)),
-    #(
-      "result",
-      json.object([
-        #("protocolVersion", json.string("2024-11-05")),
-        #(
-          "capabilities",
-          json.object([
-            #("tools", json.object([])),
-            #("resources", json.object([])),
-          ]),
-        ),
-        #(
-          "serverInfo",
-          json.object([
-            #("name", json.string("gleam-package-mcp")),
-            #("version", json.string("2.0.0")),
-          ]),
-        ),
-      ]),
-    ),
-  ])
+fn handle_initialize(req: McpRequest, ctx: WorkerContext) -> Promise(json.Json) {
+  // Initialize cache schema in background if we have a database
+  case ctx.db {
+    Some(db) -> {
+      schedule_background(ctx, cache.init_schema(db))
+    }
+    None -> Nil
+  }
+
+  promise.resolve(
+    json.object([
+      #("jsonrpc", json.string("2.0")),
+      #("id", json.string(req.id)),
+      #(
+        "result",
+        json.object([
+          #("protocolVersion", json.string("2024-11-05")),
+          #(
+            "capabilities",
+            json.object([
+              #("tools", json.object([])),
+              #("resources", json.object([])),
+            ]),
+          ),
+          #(
+            "serverInfo",
+            json.object([
+              #("name", json.string("gleam-package-mcp")),
+              #("version", json.string("2.1.0")),
+            ]),
+          ),
+        ]),
+      ),
+    ]),
+  )
 }
 
-fn handle_tools_list(req: McpRequest) -> json.Json {
+fn handle_tools_list(req: McpRequest) -> Promise(json.Json) {
   let tools = [
     tool_definition(
       "search_packages",
       "Search for Gleam packages on hex.pm by name or description",
-      [#("query", "string", "Search query for package name or description", True)],
+      [
+        #(
+          "query",
+          "string",
+          "Search query for package name or description",
+          True,
+        ),
+      ],
     ),
     tool_definition(
       "get_package_info",
@@ -144,8 +218,18 @@ fn handle_tools_list(req: McpRequest) -> json.Json {
       "get_module_info",
       "Get detailed information about a specific module including functions and types",
       [
-        #("package_name", "string", "Name of the package containing the module", True),
-        #("module_name", "string", "Name of the module (e.g., 'gleam/list')", True),
+        #(
+          "package_name",
+          "string",
+          "Name of the package containing the module",
+          True,
+        ),
+        #(
+          "module_name",
+          "string",
+          "Name of the module (e.g., 'gleam/list')",
+          True,
+        ),
       ],
     ),
   ]
@@ -155,6 +239,7 @@ fn handle_tools_list(req: McpRequest) -> json.Json {
     #("id", json.string(req.id)),
     #("result", json.object([#("tools", json.preprocessed_array(tools))])),
   ])
+  |> promise.resolve
 }
 
 fn tool_definition(
@@ -194,18 +279,28 @@ fn tool_definition(
   ])
 }
 
-fn handle_tool_call(req: McpRequest) -> Promise(json.Json) {
+fn handle_tool_call(req: McpRequest, ctx: WorkerContext) -> Promise(json.Json) {
   case req.params {
     CallToolParams(name: tool_name, arguments: arguments) -> {
       case tool_name {
-        "search_packages" -> handle_search_packages(req.id, arguments)
-        "get_package_info" -> handle_get_package_info(req.id, arguments)
-        "get_modules" -> handle_get_modules(req.id, arguments)
-        "get_module_info" -> handle_get_module_info(req.id, arguments)
-        _ -> promise.resolve(create_error_response(req.id, -32_602, "Unknown tool: " <> tool_name))
+        "search_packages" -> handle_search_packages(req.id, arguments, ctx)
+        "get_package_info" -> handle_get_package_info(req.id, arguments, ctx)
+        "get_modules" -> handle_get_modules(req.id, arguments, ctx)
+        "get_module_info" -> handle_get_module_info(req.id, arguments, ctx)
+        _ ->
+          promise.resolve(create_error_response(
+            req.id,
+            -32_602,
+            "Unknown tool: " <> tool_name,
+          ))
       }
     }
-    _ -> promise.resolve(create_error_response(req.id, -32_602, "Invalid params for tools/call"))
+    _ ->
+      promise.resolve(create_error_response(
+        req.id,
+        -32_602,
+        "Invalid params for tools/call",
+      ))
   }
 }
 
@@ -214,7 +309,10 @@ fn handle_resources_list(req: McpRequest) -> json.Json {
     json.object([
       #("uri", json.string("gleam://packages")),
       #("name", json.string("Popular Gleam Packages")),
-      #("description", json.string("List of popular Gleam packages from hex.pm")),
+      #(
+        "description",
+        json.string("List of popular Gleam packages from hex.pm"),
+      ),
       #("mimeType", json.string("application/json")),
     ]),
   ]
@@ -222,11 +320,17 @@ fn handle_resources_list(req: McpRequest) -> json.Json {
   json.object([
     #("jsonrpc", json.string("2.0")),
     #("id", json.string(req.id)),
-    #("result", json.object([#("resources", json.preprocessed_array(resources))])),
+    #(
+      "result",
+      json.object([#("resources", json.preprocessed_array(resources))]),
+    ),
   ])
 }
 
-fn handle_resource_read(req: McpRequest) -> Promise(json.Json) {
+fn handle_resource_read(
+  req: McpRequest,
+  _ctx: WorkerContext,
+) -> Promise(json.Json) {
   case req.params {
     ReadResourceParams(uri: uri) -> {
       case uri {
@@ -262,7 +366,10 @@ fn handle_resource_read(req: McpRequest) -> Promise(json.Json) {
                             json.string(
                               json.to_string(
                                 json.object([
-                                  #("packages", json.preprocessed_array(package_list)),
+                                  #(
+                                    "packages",
+                                    json.preprocessed_array(package_list),
+                                  ),
                                   #("total", json.int(list.length(packages))),
                                 ]),
                               ),
@@ -283,258 +390,364 @@ fn handle_resource_read(req: McpRequest) -> Promise(json.Json) {
               )
           }
         }
-        _ -> promise.resolve(create_error_response(req.id, -32_602, "Unknown resource URI: " <> uri))
+        _ ->
+          promise.resolve(create_error_response(
+            req.id,
+            -32_602,
+            "Unknown resource URI: " <> uri,
+          ))
       }
     }
-    _ -> promise.resolve(create_error_response(req.id, -32_602, "Invalid params for resources/read"))
+    _ ->
+      promise.resolve(create_error_response(
+        req.id,
+        -32_602,
+        "Invalid params for resources/read",
+      ))
   }
 }
 
 // ============================================================================
-// Tool Implementations (Async)
+// Tool Implementations with Caching
 // ============================================================================
 
-fn handle_search_packages(id: String, arguments: ToolArguments) -> Promise(json.Json) {
+fn handle_search_packages(
+  id: String,
+  arguments: ToolArguments,
+  ctx: WorkerContext,
+) -> Promise(json.Json) {
   case arguments {
     SearchArguments(query: query) -> {
-      use result <- promise.map(hex_client.search_packages(query))
-      case result {
-        Ok(search_result) -> {
-          let packages =
-            search_result.packages
-            |> list.map(fn(pkg) {
-              json.object([
-                #("name", json.string(pkg.name)),
-                #("version", json.string(pkg.version)),
-                #("description", json.string(pkg.description)),
-                #("downloads", json.int(pkg.downloads)),
-                #("docs_url", json.string(pkg.docs_url)),
-              ])
-            })
+      let cache_key = cache.package_search_key(query)
+      let now = now_seconds()
 
-          // Build package list text with details
-          let package_list_text =
-            search_result.packages
-            |> list.map(fn(pkg) {
-              "- " <> pkg.name <> " v" <> pkg.version <> " (" <> int.to_string(pkg.downloads) <> " downloads)\n  " <> pkg.description
-            })
-            |> string.join("\n")
-
-          create_tool_result(
-            id,
-            "Found "
-              <> int.to_string(search_result.total)
-              <> " packages matching '"
-              <> query
-              <> "':\n\n"
-              <> package_list_text,
-            Some(json.object([#("packages", json.preprocessed_array(packages))])),
-          )
+      // Try cache first
+      case ctx.db {
+        Some(db) -> {
+          use cached <- promise.await(cache.get(db, cache_key, now))
+          case cached {
+            Some(cached_json) -> {
+              // Cache hit - parse and return
+              case
+                json.parse(
+                  cached_json,
+                  hex_client.package_search_result_decoder(),
+                )
+              {
+                Ok(search_result) -> {
+                  promise.resolve(format_search_result(id, query, search_result))
+                }
+                Error(_) -> fetch_and_cache_search(id, query, ctx)
+              }
+            }
+            None -> fetch_and_cache_search(id, query, ctx)
+          }
         }
-        Error(err) ->
-          create_error_response(
-            id,
-            -32_603,
-            "Search failed: " <> hex_client.describe_error(err),
-          )
+        None -> fetch_and_cache_search(id, query, ctx)
       }
     }
-    _ -> promise.resolve(create_error_response(id, -32_602, "Invalid arguments for search_packages"))
+    _ ->
+      promise.resolve(create_error_response(
+        id,
+        -32_602,
+        "Invalid arguments for search_packages",
+      ))
   }
 }
 
-fn handle_get_package_info(id: String, arguments: ToolArguments) -> Promise(json.Json) {
+fn fetch_and_cache_search(
+  id: String,
+  query: String,
+  ctx: WorkerContext,
+) -> Promise(json.Json) {
+  use result <- promise.map(hex_client.search_packages(query))
+  case result {
+    Ok(search_result) -> {
+      // Cache in background
+      case ctx.db {
+        Some(db) -> {
+          let cache_key = cache.package_search_key(query)
+          let cache_value = encode_search_result(search_result)
+          schedule_background(
+            ctx,
+            cache.set(
+              db,
+              cache_key,
+              cache_value,
+              now_seconds(),
+              cache.default_ttl,
+            ),
+          )
+        }
+        None -> Nil
+      }
+      format_search_result(id, query, search_result)
+    }
+    Error(err) ->
+      create_error_response(
+        id,
+        -32_603,
+        "Search failed: " <> hex_client.describe_error(err),
+      )
+  }
+}
+
+fn format_search_result(
+  id: String,
+  query: String,
+  search_result: hex_client.PackageSearchResult,
+) -> json.Json {
+  let packages =
+    search_result.packages
+    |> list.map(fn(pkg) {
+      json.object([
+        #("name", json.string(pkg.name)),
+        #("version", json.string(pkg.version)),
+        #("description", json.string(pkg.description)),
+        #("downloads", json.int(pkg.downloads)),
+        #("docs_url", json.string(pkg.docs_url)),
+      ])
+    })
+
+  let package_list_text =
+    search_result.packages
+    |> list.map(fn(pkg) {
+      "- "
+      <> pkg.name
+      <> " v"
+      <> pkg.version
+      <> " ("
+      <> int.to_string(pkg.downloads)
+      <> " downloads)\n  "
+      <> pkg.description
+    })
+    |> string.join("\n")
+
+  create_tool_result(
+    id,
+    "Found "
+      <> int.to_string(search_result.total)
+      <> " packages matching '"
+      <> query
+      <> "':\n\n"
+      <> package_list_text,
+    Some(json.object([#("packages", json.preprocessed_array(packages))])),
+  )
+}
+
+fn handle_get_package_info(
+  id: String,
+  arguments: ToolArguments,
+  ctx: WorkerContext,
+) -> Promise(json.Json) {
   case arguments {
     PackageArguments(package_name: package_name) -> {
-      use result <- promise.map(hex_client.get_package_info(package_name))
-      case result {
-        Ok(pkg) -> {
-          create_tool_result(
-            id,
-            "Package: "
-              <> pkg.name
-              <> "\nVersion: "
-              <> pkg.version
-              <> "\nDescription: "
-              <> pkg.description
-              <> "\nDownloads: "
-              <> int.to_string(pkg.downloads)
-              <> "\nDocs: "
-              <> pkg.docs_url,
-            None,
-          )
+      let cache_key = cache.package_info_key(package_name)
+      let now = now_seconds()
+
+      case ctx.db {
+        Some(db) -> {
+          use cached <- promise.await(cache.get(db, cache_key, now))
+          case cached {
+            Some(cached_json) -> {
+              case json.parse(cached_json, package_decoder()) {
+                Ok(pkg) -> promise.resolve(format_package_info(id, pkg))
+                Error(_) -> fetch_and_cache_package_info(id, package_name, ctx)
+              }
+            }
+            None -> fetch_and_cache_package_info(id, package_name, ctx)
+          }
         }
-        Error(err) ->
-          create_error_response(
-            id,
-            -32_603,
-            "Package info failed: " <> hex_client.describe_error(err),
-          )
+        None -> fetch_and_cache_package_info(id, package_name, ctx)
       }
     }
-    _ -> promise.resolve(create_error_response(id, -32_602, "Invalid arguments for get_package_info"))
+    _ ->
+      promise.resolve(create_error_response(
+        id,
+        -32_602,
+        "Invalid arguments for get_package_info",
+      ))
   }
 }
 
-fn handle_get_modules(id: String, arguments: ToolArguments) -> Promise(json.Json) {
+fn fetch_and_cache_package_info(
+  id: String,
+  package_name: String,
+  ctx: WorkerContext,
+) -> Promise(json.Json) {
+  use result <- promise.map(hex_client.get_package_info(package_name))
+  case result {
+    Ok(pkg) -> {
+      case ctx.db {
+        Some(db) -> {
+          let cache_key = cache.package_info_key(package_name)
+          let cache_value = encode_package(pkg)
+          schedule_background(
+            ctx,
+            cache.set(
+              db,
+              cache_key,
+              cache_value,
+              now_seconds(),
+              cache.default_ttl,
+            ),
+          )
+        }
+        None -> Nil
+      }
+      format_package_info(id, pkg)
+    }
+    Error(err) ->
+      create_error_response(
+        id,
+        -32_603,
+        "Package info failed: " <> hex_client.describe_error(err),
+      )
+  }
+}
+
+fn format_package_info(id: String, pkg: hex_client.Package) -> json.Json {
+  create_tool_result(
+    id,
+    "Package: "
+      <> pkg.name
+      <> "\nVersion: "
+      <> pkg.version
+      <> "\nDescription: "
+      <> pkg.description
+      <> "\nDownloads: "
+      <> int.to_string(pkg.downloads)
+      <> "\nDocs: "
+      <> pkg.docs_url,
+    None,
+  )
+}
+
+fn handle_get_modules(
+  id: String,
+  arguments: ToolArguments,
+  ctx: WorkerContext,
+) -> Promise(json.Json) {
   case arguments {
     PackageArguments(package_name: package_name) -> {
-      use result <- promise.map(hex_client.fetch_package_interface(package_name))
-      case result {
-        Ok(interface) -> {
-          let modules =
-            interface.modules
-            |> list.map(fn(module_info) {
-              let types_info =
-                module_info.types
-                |> list.map(fn(type_info) {
-                  json.object([
-                    #("name", json.string(type_info.name)),
-                    #("signature", json.string(type_info.signature)),
-                    #("type_kind", json.string(type_info.type_kind)),
-                  ])
-                })
+      let cache_key = cache.package_interface_key(package_name)
+      let now = now_seconds()
 
-              json.object([
-                #("name", json.string(module_info.name)),
-                #("documentation", json.string(module_info.documentation)),
-                #("functions_count", json.int(list.length(module_info.functions))),
-                #("types_count", json.int(list.length(module_info.types))),
-                #("types", json.preprocessed_array(types_info)),
-              ])
-            })
-
-          // Build module list text with names
-          let module_list_text =
-            interface.modules
-            |> list.map(fn(m) {
-              "- " <> m.name <> " (" <> int.to_string(list.length(m.functions)) <> " functions, " <> int.to_string(list.length(m.types)) <> " types)"
-            })
-            |> string.join("\n")
-
-          create_tool_result(
-            id,
-            "Package: "
-              <> package_name
-              <> " (v"
-              <> interface.version
-              <> ")\n\nModules:\n"
-              <> module_list_text,
-            Some(json.object([#("modules", json.preprocessed_array(modules))])),
-          )
+      case ctx.db {
+        Some(db) -> {
+          use cached <- promise.await(cache.get(db, cache_key, now))
+          case cached {
+            Some(cached_json) -> {
+              case interface_parser.parse_package_interface(cached_json) {
+                Ok(interface) ->
+                  promise.resolve(format_modules(id, package_name, interface))
+                Error(_) ->
+                  fetch_and_cache_interface_for_modules(id, package_name, ctx)
+              }
+            }
+            None -> fetch_and_cache_interface_for_modules(id, package_name, ctx)
+          }
         }
-        Error(err) ->
-          create_error_response(
-            id,
-            -32_603,
-            "Failed to fetch package interface from hexdocs.pm: "
-              <> hex_client.describe_error(err),
-          )
+        None -> fetch_and_cache_interface_for_modules(id, package_name, ctx)
       }
     }
-    _ -> promise.resolve(create_error_response(id, -32_602, "Invalid arguments for get_modules"))
+    _ ->
+      promise.resolve(create_error_response(
+        id,
+        -32_602,
+        "Invalid arguments for get_modules",
+      ))
   }
 }
 
-fn handle_get_module_info(id: String, arguments: ToolArguments) -> Promise(json.Json) {
+fn fetch_and_cache_interface_for_modules(
+  id: String,
+  package_name: String,
+  _ctx: WorkerContext,
+) -> Promise(json.Json) {
+  use result <- promise.map(hex_client.fetch_package_interface(package_name))
+  case result {
+    Ok(interface) -> {
+      // Cache the raw interface JSON in background
+      // Note: We'd need to store the raw JSON, but we only have the parsed interface
+      // For now, we skip caching here since we don't have the raw JSON
+      format_modules(id, package_name, interface)
+    }
+    Error(err) ->
+      create_error_response(
+        id,
+        -32_603,
+        "Failed to fetch package interface from hexdocs.pm: "
+          <> hex_client.describe_error(err),
+      )
+  }
+}
+
+fn format_modules(
+  id: String,
+  package_name: String,
+  interface: interface_parser.PackageInterface,
+) -> json.Json {
+  let modules =
+    interface.modules
+    |> list.map(fn(module_info) {
+      let types_info =
+        module_info.types
+        |> list.map(fn(type_info) {
+          json.object([
+            #("name", json.string(type_info.name)),
+            #("signature", json.string(type_info.signature)),
+            #("type_kind", json.string(type_info.type_kind)),
+          ])
+        })
+
+      json.object([
+        #("name", json.string(module_info.name)),
+        #("documentation", json.string(module_info.documentation)),
+        #("functions_count", json.int(list.length(module_info.functions))),
+        #("types_count", json.int(list.length(module_info.types))),
+        #("types", json.preprocessed_array(types_info)),
+      ])
+    })
+
+  let module_list_text =
+    interface.modules
+    |> list.map(fn(m) {
+      "- "
+      <> m.name
+      <> " ("
+      <> int.to_string(list.length(m.functions))
+      <> " functions, "
+      <> int.to_string(list.length(m.types))
+      <> " types)"
+    })
+    |> string.join("\n")
+
+  create_tool_result(
+    id,
+    "Package: "
+      <> package_name
+      <> " (v"
+      <> interface.version
+      <> ")\n\nModules:\n"
+      <> module_list_text,
+    Some(json.object([#("modules", json.preprocessed_array(modules))])),
+  )
+}
+
+fn handle_get_module_info(
+  id: String,
+  arguments: ToolArguments,
+  _ctx: WorkerContext,
+) -> Promise(json.Json) {
   case arguments {
     ModuleArguments(package_name: package_name, module_name: module_name) -> {
       use result <- promise.map(hex_client.fetch_package_interface(package_name))
       case result {
         Ok(interface) -> {
           case interface_parser.get_module_info(interface, module_name) {
-            Ok(module_info) -> {
-              let functions =
-                module_info.functions
-                |> list.map(fn(func) {
-                  json.object([
-                    #("name", json.string(func.name)),
-                    #("signature", json.string(func.signature)),
-                    #("documentation", json.string(func.documentation)),
-                    #(
-                      "parameters",
-                      json.preprocessed_array(
-                        list.map(func.parameters, fn(param) {
-                          json.object([
-                            #("label", json.string(param.label)),
-                            #("type", json.string(param.type_name)),
-                          ])
-                        }),
-                      ),
-                    ),
-                  ])
-                })
-
-              let types =
-                module_info.types
-                |> list.map(fn(type_info) {
-                  json.object([
-                    #("name", json.string(type_info.name)),
-                    #("signature", json.string(type_info.signature)),
-                    #("type_kind", json.string(type_info.type_kind)),
-                    #("documentation", json.string(type_info.documentation)),
-                  ])
-                })
-
-              // Build function list text
-              let functions_text =
-                module_info.functions
-                |> list.map(fn(func) {
-                  case func.documentation {
-                    "" -> "### " <> func.signature
-                    doc -> "### " <> func.signature <> "\n" <> doc
-                  }
-                })
-                |> string.join("\n\n")
-
-              // Build types list text
-              let types_text =
-                module_info.types
-                |> list.map(fn(t) {
-                  case t.documentation {
-                    "" -> "### " <> t.signature
-                    doc -> "### " <> t.signature <> "\n" <> doc
-                  }
-                })
-                |> string.join("\n\n")
-
-              let text_content =
-                "Module: "
-                <> module_name
-                <> " (from "
-                <> package_name
-                <> ")\n\n"
-                <> module_info.documentation
-                <> "\n\n## Functions ("
-                <> int.to_string(list.length(module_info.functions))
-                <> "):\n"
-                <> functions_text
-                <> "\n\n## Types ("
-                <> int.to_string(list.length(module_info.types))
-                <> "):\n"
-                <> types_text
-
-              json.object([
-                #("jsonrpc", json.string("2.0")),
-                #("id", json.string(id)),
-                #(
-                  "result",
-                  json.object([
-                    #(
-                      "content",
-                      json.preprocessed_array([
-                        json.object([
-                          #("type", json.string("text")),
-                          #("text", json.string(text_content)),
-                        ]),
-                      ]),
-                    ),
-                    #("functions", json.preprocessed_array(functions)),
-                    #("types", json.preprocessed_array(types)),
-                  ]),
-                ),
-              ])
-            }
+            Ok(module_info) ->
+              format_module_info(id, package_name, module_name, module_info)
             Error(err) ->
               create_error_response(id, -32_603, "Module not found: " <> err)
           }
@@ -543,12 +756,114 @@ fn handle_get_module_info(id: String, arguments: ToolArguments) -> Promise(json.
           create_error_response(
             id,
             -32_603,
-            "Failed to fetch package interface: " <> hex_client.describe_error(err),
+            "Failed to fetch package interface: "
+              <> hex_client.describe_error(err),
           )
       }
     }
-    _ -> promise.resolve(create_error_response(id, -32_602, "Invalid arguments for get_module_info"))
+    _ ->
+      promise.resolve(create_error_response(
+        id,
+        -32_602,
+        "Invalid arguments for get_module_info",
+      ))
   }
+}
+
+fn format_module_info(
+  id: String,
+  package_name: String,
+  module_name: String,
+  module_info: interface_parser.ModuleInfo,
+) -> json.Json {
+  let functions =
+    module_info.functions
+    |> list.map(fn(func) {
+      json.object([
+        #("name", json.string(func.name)),
+        #("signature", json.string(func.signature)),
+        #("documentation", json.string(func.documentation)),
+        #(
+          "parameters",
+          json.preprocessed_array(
+            list.map(func.parameters, fn(param) {
+              json.object([
+                #("label", json.string(param.label)),
+                #("type", json.string(param.type_name)),
+              ])
+            }),
+          ),
+        ),
+      ])
+    })
+
+  let types =
+    module_info.types
+    |> list.map(fn(type_info) {
+      json.object([
+        #("name", json.string(type_info.name)),
+        #("signature", json.string(type_info.signature)),
+        #("type_kind", json.string(type_info.type_kind)),
+        #("documentation", json.string(type_info.documentation)),
+      ])
+    })
+
+  let functions_text =
+    module_info.functions
+    |> list.map(fn(func) {
+      case func.documentation {
+        "" -> "### " <> func.signature
+        doc -> "### " <> func.signature <> "\n" <> doc
+      }
+    })
+    |> string.join("\n\n")
+
+  let types_text =
+    module_info.types
+    |> list.map(fn(t) {
+      case t.documentation {
+        "" -> "### " <> t.signature
+        doc -> "### " <> t.signature <> "\n" <> doc
+      }
+    })
+    |> string.join("\n\n")
+
+  let text_content =
+    "Module: "
+    <> module_name
+    <> " (from "
+    <> package_name
+    <> ")\n\n"
+    <> module_info.documentation
+    <> "\n\n## Functions ("
+    <> int.to_string(list.length(module_info.functions))
+    <> "):\n"
+    <> functions_text
+    <> "\n\n## Types ("
+    <> int.to_string(list.length(module_info.types))
+    <> "):\n"
+    <> types_text
+
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("id", json.string(id)),
+    #(
+      "result",
+      json.object([
+        #(
+          "content",
+          json.preprocessed_array([
+            json.object([
+              #("type", json.string("text")),
+              #("text", json.string(text_content)),
+            ]),
+          ]),
+        ),
+        #("functions", json.preprocessed_array(functions)),
+        #("types", json.preprocessed_array(types)),
+      ]),
+    ),
+  ])
 }
 
 // ============================================================================
@@ -558,7 +873,7 @@ fn handle_get_module_info(id: String, arguments: ToolArguments) -> Promise(json.
 fn create_tool_result(
   id: String,
   text: String,
-  extra_data: option.Option(json.Json),
+  extra_data: Option(json.Json),
 ) -> json.Json {
   let content = [
     json.object([
@@ -594,6 +909,58 @@ fn create_error_response(id: String, code: Int, message: String) -> json.Json {
       ]),
     ),
   ])
+}
+
+// ============================================================================
+// Cache Encoders/Decoders
+// ============================================================================
+
+fn encode_package(pkg: hex_client.Package) -> String {
+  json.to_string(
+    json.object([
+      #("name", json.string(pkg.name)),
+      #("version", json.string(pkg.version)),
+      #("description", json.string(pkg.description)),
+      #("downloads", json.int(pkg.downloads)),
+      #("docs_url", json.string(pkg.docs_url)),
+    ]),
+  )
+}
+
+fn package_decoder() -> decode.Decoder(hex_client.Package) {
+  use name <- decode.field("name", decode.string)
+  use version <- decode.field("version", decode.string)
+  use description <- decode.field("description", decode.string)
+  use downloads <- decode.field("downloads", decode.int)
+  use docs_url <- decode.field("docs_url", decode.string)
+  decode.success(hex_client.Package(
+    name: name,
+    version: version,
+    description: description,
+    downloads: downloads,
+    docs_url: docs_url,
+  ))
+}
+
+fn encode_search_result(result: hex_client.PackageSearchResult) -> String {
+  let packages =
+    result.packages
+    |> list.map(fn(pkg) {
+      json.object([
+        #("name", json.string(pkg.name)),
+        #("version", json.string(pkg.version)),
+        #("description", json.string(pkg.description)),
+        #("downloads", json.int(pkg.downloads)),
+        #("docs_url", json.string(pkg.docs_url)),
+      ])
+    })
+
+  json.to_string(
+    json.object([
+      #("packages", json.preprocessed_array(packages)),
+      #("total", json.int(result.total)),
+    ]),
+  )
 }
 
 // ============================================================================

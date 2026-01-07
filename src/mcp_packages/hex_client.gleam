@@ -36,8 +36,11 @@ const hex_api_base = "https://hex.pm/api"
 const hexdocs_base = "https://hexdocs.pm"
 
 /// Search for packages on hex.pm (async)
-pub fn search_packages(query: String) -> Promise(Result(PackageSearchResult, HexError)) {
-  let url = hex_api_base <> "/packages?search=" <> query <> "&sort=recent_downloads"
+pub fn search_packages(
+  query: String,
+) -> Promise(Result(PackageSearchResult, HexError)) {
+  let url =
+    hex_api_base <> "/packages?search=" <> query <> "&sort=recent_downloads"
 
   use result <- promise.map(fetch_json(url))
   case result {
@@ -47,7 +50,9 @@ pub fn search_packages(query: String) -> Promise(Result(PackageSearchResult, Hex
 }
 
 /// Get info about a specific package (async)
-pub fn get_package_info(package_name: String) -> Promise(Result(Package, HexError)) {
+pub fn get_package_info(
+  package_name: String,
+) -> Promise(Result(Package, HexError)) {
   let url = hex_api_base <> "/packages/" <> package_name
 
   use result <- promise.map(fetch_json(url))
@@ -108,7 +113,10 @@ fn fetch_json(url: String) -> Promise(Result(String, HexError)) {
             Error(_) -> Error(HttpError("Failed to read response body"))
           }
         }
-        Error(err) -> promise.resolve(Error(HttpError("Fetch failed: " <> string.inspect(err))))
+        Error(err) ->
+          promise.resolve(
+            Error(HttpError("Fetch failed: " <> string.inspect(err))),
+          )
       }
     }
     Error(_) -> promise.resolve(Error(HttpError("Invalid URL: " <> url)))
@@ -128,19 +136,18 @@ fn parse_package_list(body: String) -> Result(PackageSearchResult, HexError) {
 
   case json.parse(body, decoder) {
     Ok(packages) -> {
-      Ok(PackageSearchResult(
-        packages: packages,
-        total: list.length(packages),
-      ))
+      Ok(PackageSearchResult(packages: packages, total: list.length(packages)))
     }
-    Error(err) -> Error(ParseError("Failed to parse package list: " <> string.inspect(err)))
+    Error(err) ->
+      Error(ParseError("Failed to parse package list: " <> string.inspect(err)))
   }
 }
 
 fn parse_single_package(body: String) -> Result(Package, HexError) {
   case json.parse(body, package_decoder()) {
     Ok(pkg) -> Ok(pkg)
-    Error(err) -> Error(ParseError("Failed to parse package: " <> string.inspect(err)))
+    Error(err) ->
+      Error(ParseError("Failed to parse package: " <> string.inspect(err)))
   }
 }
 
@@ -165,21 +172,27 @@ fn package_decoder() -> decode.Decoder(Package) {
     v -> v
   }
 
-  decode.success(Package(
-    name: name,
-    version: version,
-    description: description,
-    downloads: downloads,
-    docs_url: case docs_url {
-      "" -> hexdocs_base <> "/" <> name
-      url -> url
-    },
-  ))
+  decode.success(
+    Package(
+      name: name,
+      version: version,
+      description: description,
+      downloads: downloads,
+      docs_url: case docs_url {
+        "" -> hexdocs_base <> "/" <> name
+        url -> url
+      },
+    ),
+  )
 }
 
 fn meta_decoder() -> decode.Decoder(#(String, List(String))) {
   use description <- decode.optional_field("description", "", decode.string)
-  use licenses <- decode.optional_field("licenses", [], decode.list(decode.string))
+  use licenses <- decode.optional_field(
+    "licenses",
+    [],
+    decode.list(decode.string),
+  )
   decode.success(#(description, licenses))
 }
 
@@ -196,4 +209,10 @@ pub fn describe_error(error: HexError) -> String {
     ParseError(msg) -> "Parse error: " <> msg
     NotFound(msg) -> "Not found: " <> msg
   }
+}
+
+pub fn package_search_result_decoder() -> decode.Decoder(PackageSearchResult) {
+  use packages <- decode.field("packages", decode.list(package_decoder()))
+  use total <- decode.field("total", decode.int)
+  decode.success(PackageSearchResult(packages: packages, total: total))
 }

@@ -12,5 +12,7 @@ gleam_http = ">= 4.0.0 and < 5.0.0"
 gleam_fetch = ">= 1.0.0 and < 2.0.0"
 gleam_javascript = ">= 1.0.0 and < 2.0.0"
 plinth = ">= 0.8.0 and < 1.0.0"
+plinth_cloudflare = ">= 1.1.0 and < 2.0.0"
+conversation = ">= 2.0.0 and < 3.0.0"
 
 [dev-dependencies]

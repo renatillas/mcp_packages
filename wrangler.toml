@@ -6,6 +6,11 @@ compatibility_flags = ["nodejs_compat"]
 [build]
 command = "gleam build"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "mcp-packages-cache"
+database_id = "local"
+
 # Uncomment to add a custom domain
 # [routes]
 # pattern = "your-domain.com/*"
