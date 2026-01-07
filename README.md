@@ -1,55 +1,58 @@
 # Gleam Package MCP Server
 
-[![Package Version](https://img.shields.io/hexpm/v/mcp_packages)](https://hex.pm/packages/mcp_packages)
-[![Hex Docs](https://img.shields.io/badge/hex-docs-ffaff3)](https://hexdocs.pm/mcp_packages/)
-
-An MCP (Model Context Protocol) server that provides AI agents with access to Gleam package information, search, and documentation.
+An MCP (Model Context Protocol) server that provides AI agents with access to Gleam package information, search, and documentation. Built with Gleam and runs on Cloudflare Workers.
 
 ## Features
 
-- **Search Gleam packages** by name or description
-- **Get detailed package information** including versions and descriptions  
-- **Build and access package documentation** with pagination support for large packages
-- **Automatic package synchronization** every 6 hours
-- **Persistent documentation caching** for faster subsequent requests
+- **Search Gleam packages** by name or description via hex.pm API
+- **Get detailed package information** including versions, downloads, and descriptions
+- **Browse package modules** with function and type counts
+- **Get module documentation** including function signatures, types, and docs
+- **D1 database caching** for fast repeat queries with automatic TTL expiration
+- **Background caching** using Cloudflare's `waitUntil` for non-blocking cache writes
+
+## Architecture
+
+Built with:
+- **Gleam** - Type-safe functional language
+- **plinth_cloudflare** - Cloudflare Workers bindings (D1, worker context)
+- **conversation** - Clean JS Request/Response conversions
+- **Cloudflare Workers** - Edge deployment with D1 SQLite database
 
 ## Quick Start
 
 ### Local Development
+
 ```sh
 gleam deps download
-gleam run   # Starts the MCP server on port 3000
+npm install
+npm run dev   # Starts wrangler dev server
 ```
 
-### Use Hosted Version
-The MCP server is deployed and available at: **https://gleam-package-mcp.fly.dev**
+### Deploy to Cloudflare
+
+```sh
+# Create D1 database (first time only)
+npx wrangler d1 create mcp-packages-cache
+
+# Update wrangler.toml with the database_id from above
+
+# Deploy
+npm run deploy
+```
 
 ## MCP Integration
 
 ### Claude Code
 
-Add to your Claude Code configuration:
+Add to your Claude Code MCP configuration:
 
-**Option 1: Use hosted version (recommended)**
 ```json
 {
   "mcpServers": {
-    "gleam-mcp": {
+    "gleam-packages": {
       "transport": "http",
-      "url": "https://gleam-package-mcp.fly.dev"
-    }
-  }
-}
-```
-
-**Option 2: Run locally**
-```json
-{
-  "mcpServers": {
-    "gleam-mcp": {
-      "command": "gleam",
-      "args": ["run"],
-      "cwd": "/path/to/mcp_packages"
+      "url": "https://your-worker.workers.dev"
     }
   }
 }
@@ -57,26 +60,12 @@ Add to your Claude Code configuration:
 
 ### Other AI Agents (Cline, Continue, Cursor)
 
-**Using hosted version:**
 ```json
 {
   "mcpServers": {
-    "gleam-mcp": {
+    "gleam-packages": {
       "transport": "http",
-      "url": "https://gleam-package-mcp.fly.dev"
-    }
-  }
-}
-```
-
-**Running locally:**
-```json
-{
-  "mcpServers": {
-    "gleam-mcp": {
-      "command": "gleam", 
-      "args": ["run"],
-      "cwd": "/absolute/path/to/mcp_packages"
+      "url": "https://your-worker.workers.dev"
     }
   }
 }
@@ -84,23 +73,78 @@ Add to your Claude Code configuration:
 
 ## Available Tools
 
-1. `search_packages` - Search for Gleam packages by name or description
-2. `get_package_info` - Get detailed information about a specific package  
-3. `get_package_interface` - Build documentation and extract interface JSON (with pagination)
+### `search_packages`
+Search for Gleam packages on hex.pm by name or description.
 
-## Usage Examples
+**Parameters:**
+- `query` (string, required) - Search query for package name or description
 
-Once integrated with your AI agent:
+**Example:** "Search for packages related to json"
 
-- "Search for Gleam packages related to json"
-- "Get information about the wisp package"
-- "Build documentation for the gleam_http package"
+### `get_package_info`
+Get detailed information about a specific package from hex.pm.
+
+**Parameters:**
+- `package_name` (string, required) - Name of the package
+
+**Example:** "Get info about the wisp package"
+
+### `get_modules`
+Get a list of all modules in a package with their documentation from hexdocs.pm.
+
+**Parameters:**
+- `package_name` (string, required) - Name of the package
+
+**Example:** "List all modules in gleam_stdlib"
+
+### `get_module_info`
+Get detailed information about a specific module including functions and types.
+
+**Parameters:**
+- `package_name` (string, required) - Name of the package containing the module
+- `module_name` (string, required) - Name of the module (e.g., 'gleam/list')
+
+**Example:** "Show me the functions in gleam/option"
+
+## Available Resources
+
+### `gleam://packages`
+Lists popular Gleam packages from hex.pm sorted by recent downloads.
+
+## Caching
+
+The server uses Cloudflare D1 (SQLite) for caching with the following TTLs:
+
+| Data Type | TTL |
+|-----------|-----|
+| Package info | 1 hour |
+| Search results | 1 hour |
+| Package interfaces | 24 hours |
+
+Cache writes happen in the background using `waitUntil`, so responses are returned immediately while caching completes asynchronously.
 
 ## Development
 
 ```sh
-gleam run   # Run the project
-gleam test  # Run the tests
+npm run dev      # Start local dev server with wrangler
+npm run build    # Build the Gleam project
+npm run deploy   # Deploy to Cloudflare Workers
 ```
 
-Further documentation can be found at <https://hexdocs.pm/mcp_packages>.
+## Configuration
+
+**wrangler.toml:**
+```toml
+name = "gleam-package-mcp"
+main = "src/index.mjs"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[build]
+command = "gleam build"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mcp-packages-cache"
+database_id = "your-database-id"
+```

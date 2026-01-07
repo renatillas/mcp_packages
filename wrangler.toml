@@ -9,7 +9,7 @@ command = "gleam build"
 [[d1_databases]]
 binding = "DB"
 database_name = "mcp-packages-cache"
-database_id = "local"
+database_id = "d52e04bf-5716-419a-a159-f64919993d45"
 
 # Uncomment to add a custom domain
 # [routes]
