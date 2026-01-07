@@ -108,7 +108,7 @@ fn interface_decoder() -> decode.Decoder(PackageInterface) {
   use gleam_version_constraint <- decode.optional_field(
     "gleam-version-constraint",
     "",
-    decode.string,
+    decode.one_of(decode.string, [decode.success("")]),
   )
   use modules_dict <- decode.field(
     "modules",
