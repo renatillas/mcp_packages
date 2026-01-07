@@ -489,7 +489,6 @@ fn fetch_and_cache_search(
         Some(db) -> {
           let cache_key = cache.package_search_key(query)
           let cache_value = encode_search_result(search_result)
-          logger.cache_write(cache_key)
           schedule_background(
             ctx,
             cache.set(
@@ -610,7 +609,6 @@ fn fetch_and_cache_package_info(
         Some(db) -> {
           let cache_key = cache.package_info_key(package_name)
           let cache_value = encode_package(pkg)
-          logger.cache_write(cache_key)
           schedule_background(
             ctx,
             cache.set(

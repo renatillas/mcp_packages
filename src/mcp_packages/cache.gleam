@@ -2,6 +2,7 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/javascript/promise.{type Promise}
 import gleam/option.{type Option, None, Some}
+import mcp_packages/logger
 import plinth/cloudflare/d1.{type Database}
 
 /// Cache entry with expiration
@@ -17,6 +18,7 @@ pub const interface_ttl = 86_400
 
 /// Initialize the cache tables (run once)
 pub fn init_schema(db: Database) -> Promise(Result(Nil, String)) {
+  logger.debug("Initializing cache schema...")
   let sql =
     "
     CREATE TABLE IF NOT EXISTS cache (
@@ -29,8 +31,14 @@ pub fn init_schema(db: Database) -> Promise(Result(Nil, String)) {
 
   use result <- promise.map(d1.exec(db, sql))
   case result {
-    Ok(_) -> Ok(Nil)
-    Error(err) -> Error(err)
+    Ok(_) -> {
+      logger.info("Cache schema initialized successfully")
+      Ok(Nil)
+    }
+    Error(err) -> {
+      logger.error("Failed to initialize cache schema: " <> err)
+      Error(err)
+    }
   }
 }
 
@@ -52,7 +60,10 @@ pub fn get(
         Error(_) -> None
       }
     }
-    Error(_) -> None
+    Error(err) -> {
+      logger.error("Cache get failed for key '" <> key <> "': " <> err)
+      None
+    }
   }
 }
 
@@ -74,8 +85,14 @@ pub fn set(
 
   use result <- promise.map(d1.run(stmt))
   case result {
-    Ok(_) -> Ok(Nil)
-    Error(err) -> Error(err)
+    Ok(_) -> {
+      logger.debug("Cache set successful for key: " <> key)
+      Ok(Nil)
+    }
+    Error(err) -> {
+      logger.error("Cache set failed for key '" <> key <> "': " <> err)
+      Error(err)
+    }
   }
 }
 
